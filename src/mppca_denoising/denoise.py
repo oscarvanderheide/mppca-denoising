@@ -3,26 +3,19 @@
 Implements the sliding-window approach from:
     Olesen et al., "Tensor denoising of multidimensional MRI data",
     Magn Reson Med, 2022. doi:10.1002/mrm.29478
-
-Usage is free but please cite the paper above.
-
-Assumes data shape (*spatial_dims, M): any number of spatial dims followed by a
-single measurement dimension. All patches are denoised in parallel via batched SVD.
 """
 
 from __future__ import annotations
 
 import os
-import warnings
 from math import prod
 
 import numpy as np
 import torch
 
-# Prefer cuSOLVER syevjBatched for all CUDA eigh calls — it is dramatically faster
-# for batched small matrices than the default heuristics (see PyTorch PR #175403).
-# Backend 3 = syevjBatched, which is a separate API from the xsyevBatched that
-# caused CUSOLVER_STATUS_INVALID_VALUE; it scales to large batch counts safely.
+# Force cuSOLVER syevjBatched for CUDA eigh — ~25x faster than the default syevd
+# heuristic for batched small matrices (our (B, K, K) gram matrices, K = min(W, M)).
+# https://github.com/pytorch/pytorch/pull/175403
 os.environ.setdefault("TORCH_LINALG_EIGH_BACKEND", "3")
 
 
@@ -59,14 +52,6 @@ def denoise_tensor(
         P: Signal component count per voxel, shape ``spatial_dims``.
         SNR_gain: Estimated SNR improvement per voxel, shape ``spatial_dims``.
     """
-    if device is not None and (
-        isinstance(device, str)
-        and "cuda" in device
-        or isinstance(device, torch.device)
-        and device.type == "cuda"
-    ):
-        # Increase batch_size for CUDA to saturate the A5000
-        batch_size = max(batch_size, 262144)
 
     with torch.no_grad():
         data, window, mask, stride, device, dtype = _prepare_inputs(
@@ -146,8 +131,8 @@ def denoise_tensor(
 
             if center_assign:
                 c_inds = vox_inds_b[:, centre_ind]  # (B',)
-                _scatter_add_2d(
-                    denoised,
+                denoised.scatter_add_(
+                    0,
                     c_inds.unsqueeze(1).expand(-1, M_meas),
                     patches_den[:, centre_ind, :],
                 )
@@ -158,8 +143,8 @@ def denoise_tensor(
                 P_out.scatter_add_(0, c_inds, p_b.to(P_out.dtype))
             else:
                 flat_inds = vox_inds_b.reshape(-1)  # (B'*W,)
-                _scatter_add_2d(
-                    denoised,
+                denoised.scatter_add_(
+                    0,
                     flat_inds.unsqueeze(1).expand(-1, M_meas),
                     patches_den.reshape(-1, M_meas),
                 )
@@ -211,32 +196,6 @@ def denoise_tensor(
 
 
 # ---------------------------------------------------------------------------
-# Scatter helper (complex-safe)
-# ---------------------------------------------------------------------------
-
-
-def _scatter_add_2d(
-    dest: torch.Tensor,
-    row_idx: torch.Tensor,
-    src: torch.Tensor,
-) -> None:
-    """In-place scatter_add along dim=0 that works for complex tensors on MPS.
-
-    MPS does not support ``scatter_add_`` for complex dtypes.  We work around
-    this by viewing both buffers as real (doubled last dimension) via
-    ``torch.view_as_real`` — which returns a true view — so the scatter still
-    writes back into the original complex storage.
-    """
-    if dest.is_complex():
-        M = dest.shape[1]
-        dest_r = torch.view_as_real(dest).reshape(dest.shape[0], M * 2)
-        src_r = torch.view_as_real(src.contiguous()).reshape(src.shape[0], M * 2)
-        dest_r.scatter_add_(0, row_idx.repeat_interleave(2, dim=1), src_r)
-    else:
-        dest.scatter_add_(0, row_idx, src)
-
-
-# ---------------------------------------------------------------------------
 # Batched patch denoising
 # ---------------------------------------------------------------------------
 
@@ -280,30 +239,19 @@ def _denoise_patches(
     # Build gram matrix on the smaller dimension and decompose.
     # eigh on (K×K) << SVD on (W×M) when W>>M or M>>W.
     # mH is the conjugate-transpose (= regular transpose for real inputs).
-    #
-    # eigh device selection:
-    #   - MPS: not yet natively implemented on Metal, must use CPU.
-    #   - CUDA: runs on GPU using syevjBatched (forced via TORCH_LINALG_EIGH_BACKEND=3
-    #     set at module import). ~25x faster than the default syevd heuristic for
-    #     batched small matrices (PyTorch PR #175403). Uses a 32-bit Jacobi API that
-    #     does not have the batch-count limits of xsyevBatched (syevd).
-    #   - CPU: runs on device directly.
-    eigh_device = torch.device("cpu") if device.type == "mps" else device
     if W >= M:
         # C = Xᵀ X  shape (B, M, M); V columns are right singular vectors
-        gram = patches.mH @ patches  # on device
-        vals2, V = torch.linalg.eigh(gram.to(eigh_device))
-        vals2 = (
-            vals2.flip(-1).clamp(min=0).to(device)
-        )  # (B, K) descending, non-negative
-        V = V.flip(-1).to(device)  # (B, M, K)
+        gram = patches.mH @ patches
+        vals2, V = torch.linalg.eigh(gram)
+        vals2 = vals2.flip(-1).clamp(min=0)  # (B, K) descending, non-negative
+        V = V.flip(-1)  # (B, M, K)
         XV = patches @ V  # (B, W, K): col k ≈ U_k * s_k
     else:
         # C = X Xᵀ  shape (B, W, W); U columns are left singular vectors
-        gram = patches @ patches.mH  # on device
-        vals2, U = torch.linalg.eigh(gram.to(eigh_device))
-        vals2 = vals2.flip(-1).clamp(min=0).to(device)  # (B, K) descending
-        U = U.flip(-1).to(device)  # (B, W, K)
+        gram = patches @ patches.mH
+        vals2, U = torch.linalg.eigh(gram)
+        vals2 = vals2.flip(-1).clamp(min=0)  # (B, K) descending
+        U = U.flip(-1)  # (B, W, K)
         XV = U.mH @ patches  # (B, K, M): row k ≈ s_k * V_kᴴ
 
     if sigma2 is None:
@@ -419,20 +367,8 @@ def _prepare_inputs(data, window, mask, stride, device, dtype=None):
     if isinstance(device, str):
         device = torch.device(device)
 
-    if device.type in ("mps", "cuda"):
-        # eigh runs on CPU for both MPS (not natively implemented) and CUDA
-        # (cusolverDnXsyevBatched float32 is unreliable across cuSOLVER versions).
-        # The gram matrices are tiny so the host round-trip is negligible;
-        # all heavy matmuls stay on device.
-        if device.type == "mps" and not os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK"):
-            warnings.warn(
-                "MPS device: torch.linalg.eigh will run on CPU (not yet MPS-native). "
-                "Heavy matmuls still use Metal.",
-                stacklevel=3,
-            )
-
     if dtype is None:
-        if device.type in ("cuda", "mps"):
+        if device.type == "cuda":
             dtype = torch.complex64 if data.is_complex() else torch.float32
         else:
             dtype = data.dtype
