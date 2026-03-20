@@ -104,16 +104,13 @@ def denoise_tensor(
         N_corners = len(valid_corners)
 
         # --- Accumulators ---
+        real_dtype = torch.zeros(
+            1, dtype=dtype
+        ).real.dtype  # float32 for complex64 etc.
         denoised = torch.zeros_like(data_2d)
-        count = torch.zeros(
-            num_vox, dtype=dtype.real if dtype.is_complex else dtype, device=device
-        )
-        Sigma2 = torch.zeros(
-            num_vox, dtype=dtype.real if dtype.is_complex else dtype, device=device
-        )
-        P_out = torch.zeros(
-            num_vox, dtype=dtype.real if dtype.is_complex else dtype, device=device
-        )
+        count = torch.zeros(num_vox, dtype=real_dtype, device=device)
+        Sigma2 = torch.zeros(num_vox, dtype=real_dtype, device=device)
+        P_out = torch.zeros(num_vox, dtype=real_dtype, device=device)
 
         # --- Mini-batch loop ---
         # Patch index matrices are built on-the-fly per batch to bound peak memory,
@@ -143,8 +140,8 @@ def denoise_tensor(
 
             if center_assign:
                 c_inds = vox_inds_b[:, centre_ind]  # (B',)
-                denoised.scatter_add_(
-                    0,
+                _scatter_add_2d(
+                    denoised,
                     c_inds.unsqueeze(1).expand(-1, M_meas),
                     patches_den[:, centre_ind, :],
                 )
@@ -155,8 +152,8 @@ def denoise_tensor(
                 P_out.scatter_add_(0, c_inds, p_b.to(P_out.dtype))
             else:
                 flat_inds = vox_inds_b.reshape(-1)  # (B'*W,)
-                denoised.scatter_add_(
-                    0,
+                _scatter_add_2d(
+                    denoised,
                     flat_inds.unsqueeze(1).expand(-1, M_meas),
                     patches_den.reshape(-1, M_meas),
                 )
@@ -205,6 +202,32 @@ def denoise_tensor(
             P_out.reshape(dims_vox),
             SNR_gain.reshape(dims_vox),
         )
+
+
+# ---------------------------------------------------------------------------
+# Scatter helper (complex-safe)
+# ---------------------------------------------------------------------------
+
+
+def _scatter_add_2d(
+    dest: torch.Tensor,
+    row_idx: torch.Tensor,
+    src: torch.Tensor,
+) -> None:
+    """In-place scatter_add along dim=0 that works for complex tensors on MPS.
+
+    MPS does not support ``scatter_add_`` for complex dtypes.  We work around
+    this by viewing both buffers as real (doubled last dimension) via
+    ``torch.view_as_real`` — which returns a true view — so the scatter still
+    writes back into the original complex storage.
+    """
+    if dest.is_complex():
+        M = dest.shape[1]
+        dest_r = torch.view_as_real(dest).reshape(dest.shape[0], M * 2)
+        src_r = torch.view_as_real(src.contiguous()).reshape(src.shape[0], M * 2)
+        dest_r.scatter_add_(0, row_idx.repeat_interleave(2, dim=1), src_r)
+    else:
+        dest.scatter_add_(0, row_idx, src)
 
 
 # ---------------------------------------------------------------------------
