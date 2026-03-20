@@ -60,138 +60,141 @@ def denoise_tensor(
         # Increase batch_size for CUDA to saturate the A5000
         batch_size = max(batch_size, 262144)
 
-    data, window, mask, stride, device, dtype = _prepare_inputs(
-        data, window, mask, stride, device, dtype
-    )
-    dims = data.shape
-    n_spatial = len(window)
-    dims_vox = dims[:n_spatial]
-    M_meas = prod(dims[n_spatial:])
-    W = prod(window)
-    num_vox = prod(dims_vox)
+    with torch.no_grad():
+        data, window, mask, stride, device, dtype = _prepare_inputs(
+            data, window, mask, stride, device, dtype
+        )
+        dims = data.shape
+        n_spatial = len(window)
+        dims_vox = dims[:n_spatial]
+        M_meas = prod(dims[n_spatial:])
+        W = prod(window)
+        num_vox = prod(dims_vox)
 
-    data_2d = data.reshape(num_vox, M_meas)
-    mask_flat = mask.reshape(num_vox)
+        data_2d = data.reshape(num_vox, M_meas)
+        mask_flat = mask.reshape(num_vox)
 
-    # C-order strides for the spatial volume and for the window
-    sp_strides = _c_strides(dims_vox, device)
-    win_strides = _c_strides(tuple(window), device)
+        # C-order strides for the spatial volume and for the window
+        sp_strides = _c_strides(dims_vox, device)
+        win_strides = _c_strides(tuple(window), device)
 
-    # Linear offsets of every voxel within a (window-shaped) patch
-    window_subs = _ind2sub_c(window, torch.arange(W, device=device))  # (W, n_spatial)
-    index_increments = (window_subs * sp_strides).sum(1)  # (W,)
+        # Linear offsets of every voxel within a (window-shaped) patch
+        window_subs = _ind2sub_c(window, torch.arange(W, device=device))  # (W, n_spatial)
+        index_increments = (window_subs * sp_strides).sum(1)  # (W,)
 
-    # Centre voxel: C-order position within the W-element window array
-    centre_subs = torch.tensor([(w - 1) // 2 for w in window], device=device)
-    centre_ind = int((centre_subs * win_strides).sum().item())
+        # Centre voxel: C-order position within the W-element window array
+        centre_subs = torch.tensor([(w - 1) // 2 for w in window], device=device)
+        centre_ind = int((centre_subs * win_strides).sum().item())
 
-    # --- Vectorised validity filter over all voxel positions ---
-    all_subs = _ind2sub_c(
-        dims_vox, torch.arange(num_vox, device=device)
-    )  # (num_vox, n_spatial)
-    win_t = torch.tensor(window, device=device)
-    dim_t = torch.tensor(list(dims_vox), device=device)
-    str_t = torch.tensor(stride, device=device)
-    geom_valid = ((all_subs + win_t) <= dim_t).all(1) & (all_subs % str_t == 0).all(1)
-    valid_corners = torch.where(geom_valid)[0]  # (N_corners,)
-    N_corners = len(valid_corners)
+        # --- Vectorised validity filter over all voxel positions ---
+        all_subs = _ind2sub_c(
+            dims_vox, torch.arange(num_vox, device=device)
+        )  # (num_vox, n_spatial)
+        win_t = torch.tensor(window, device=device)
+        dim_t = torch.tensor(list(dims_vox), device=device)
+        str_t = torch.tensor(stride, device=device)
+        geom_valid = ((all_subs + win_t) <= dim_t).all(1) & (all_subs % str_t == 0).all(1)
+        valid_corners = torch.where(geom_valid)[0]  # (N_corners,)
+        N_corners = len(valid_corners)
 
-    # --- Accumulators ---
-    denoised = torch.zeros_like(data_2d)
-    count = torch.zeros(
-        num_vox, dtype=dtype.real if dtype.is_complex else dtype, device=device
-    )
-    Sigma2 = torch.zeros(
-        num_vox, dtype=dtype.real if dtype.is_complex else dtype, device=device
-    )
-    P_out = torch.zeros(
-        num_vox, dtype=dtype.real if dtype.is_complex else dtype, device=device
-    )
+        # --- Accumulators ---
+        denoised = torch.zeros_like(data_2d)
+        count = torch.zeros(
+            num_vox, dtype=dtype.real if dtype.is_complex else dtype, device=device
+        )
+        Sigma2 = torch.zeros(
+            num_vox, dtype=dtype.real if dtype.is_complex else dtype, device=device
+        )
+        P_out = torch.zeros(
+            num_vox, dtype=dtype.real if dtype.is_complex else dtype, device=device
+        )
 
-    # --- Mini-batch loop ---
-    # Patch index matrices are built on-the-fly per batch to bound peak memory,
-    # then filtered by the mask before extraction.
-    n_done = 0
-    for b_start in range(0, N_corners, batch_size):
-        corners_b = valid_corners[b_start : b_start + batch_size]
-        vox_inds_b = corners_b.unsqueeze(1) + index_increments.unsqueeze(0)  # (B, W)
+        # --- Mini-batch loop ---
+        # Patch index matrices are built on-the-fly per batch to bound peak memory,
+        # then filtered by the mask before extraction.
+        n_done = 0
+        for b_start in range(0, N_corners, batch_size):
+            corners_b = valid_corners[b_start : b_start + batch_size]
+            vox_inds_b = corners_b.unsqueeze(1) + index_increments.unsqueeze(0)  # (B, W)
 
-        # Mask filter
-        if center_assign:
-            mask_ok = mask_flat[vox_inds_b[:, centre_ind]]
-        else:
-            mask_ok = mask_flat[vox_inds_b].any(1)
+            # Mask filter
+            if center_assign:
+                mask_ok = mask_flat[vox_inds_b[:, centre_ind]]
+            else:
+                mask_ok = mask_flat[vox_inds_b].any(1)
 
-        if mask_ok.numel() == 0 or not mask_ok.any():
+            if mask_ok.numel() == 0 or not mask_ok.any():
+                n_done += len(corners_b)
+                continue
+
+            vox_inds_b = vox_inds_b[mask_ok]
+            patches = data_2d[vox_inds_b]  # (B', W, M_meas)
+            patches_den, s2_b, p_b = _denoise_patches(
+                patches, opt_shrink=opt_shrink, sigma2=sigma2
+            )
+
+            if center_assign:
+                c_inds = vox_inds_b[:, centre_ind]  # (B',)
+                denoised.scatter_add_(
+                    0, c_inds.unsqueeze(1).expand(-1, M_meas), patches_den[:, centre_ind, :]
+                )
+                count.scatter_add_(
+                    0, c_inds, torch.ones(len(c_inds), dtype=count.dtype, device=device)
+                )
+                Sigma2.scatter_add_(0, c_inds, s2_b)
+                P_out.scatter_add_(0, c_inds, p_b.to(P_out.dtype))
+            else:
+                flat_inds = vox_inds_b.reshape(-1)  # (B'*W,)
+                denoised.scatter_add_(
+                    0,
+                    flat_inds.unsqueeze(1).expand(-1, M_meas),
+                    patches_den.reshape(-1, M_meas),
+                )
+                count.scatter_add_(
+                    0,
+                    flat_inds,
+                    torch.ones(len(flat_inds), dtype=count.dtype, device=device),
+                )
+                Sigma2.scatter_add_(
+                    0, flat_inds, s2_b.unsqueeze(1).expand(-1, W).reshape(-1)
+                )
+                P_out.scatter_add_(
+                    0,
+                    flat_inds,
+                    p_b.to(P_out.dtype).unsqueeze(1).expand(-1, W).reshape(-1),
+                )
+
             n_done += len(corners_b)
-            continue
+            print(
+                f"\r  Patches: {n_done}/{N_corners} ({100 * n_done / N_corners:.0f}%)",
+                end="",
+                flush=True,
+            )
 
-        vox_inds_b = vox_inds_b[mask_ok]
-        patches = data_2d[vox_inds_b]  # (B', W, M_meas)
-        patches_den, s2_b, p_b = _denoise_patches(
-            patches, opt_shrink=opt_shrink, sigma2=sigma2
+        print(f"\r  Patches: {N_corners}/{N_corners} (100%)")
+
+        # --- Average overlapping contributions ---
+        skipped = count == 0
+        denoised[skipped] = data_2d[skipped]
+        Sigma2[skipped] = float("nan")
+        P_out[skipped] = float("nan")
+        count[skipped] = 1
+        denoised /= count.unsqueeze(1)
+        Sigma2 /= count
+        P_out /= count
+
+        # SNR gain: sqrt(W*M / (P*(W + M - P)))
+        SNR_gain = torch.sqrt(
+            torch.tensor(float(W * M_meas), dtype=P_out.dtype, device=device)
+            / (P_out * (W + M_meas - P_out))
         )
 
-        if center_assign:
-            c_inds = vox_inds_b[:, centre_ind]  # (B',)
-            denoised.scatter_add_(
-                0, c_inds.unsqueeze(1).expand(-1, M_meas), patches_den[:, centre_ind, :]
-            )
-            count.scatter_add_(
-                0, c_inds, torch.ones(len(c_inds), dtype=count.dtype, device=device)
-            )
-            Sigma2.scatter_add_(0, c_inds, s2_b)
-            P_out.scatter_add_(0, c_inds, p_b.to(P_out.dtype))
-        else:
-            flat_inds = vox_inds_b.reshape(-1)  # (B'*W,)
-            denoised.scatter_add_(
-                0,
-                flat_inds.unsqueeze(1).expand(-1, M_meas),
-                patches_den.reshape(-1, M_meas),
-            )
-            count.scatter_add_(
-                0,
-                flat_inds,
-                torch.ones(len(flat_inds), dtype=count.dtype, device=device),
-            )
-            Sigma2.scatter_add_(
-                0, flat_inds, s2_b.unsqueeze(1).expand(-1, W).reshape(-1)
-            )
-            P_out.scatter_add_(
-                0, flat_inds, p_b.to(P_out.dtype).unsqueeze(1).expand(-1, W).reshape(-1)
-            )
-
-        n_done += len(corners_b)
-        print(
-            f"\r  Patches: {n_done}/{N_corners} ({100 * n_done / N_corners:.0f}%)",
-            end="",
-            flush=True,
+        return (
+            denoised.reshape(dims),
+            Sigma2.reshape(dims_vox),
+            P_out.reshape(dims_vox),
+            SNR_gain.reshape(dims_vox),
         )
-
-    print(f"\r  Patches: {N_corners}/{N_corners} (100%)")
-
-    # --- Average overlapping contributions ---
-    skipped = count == 0
-    denoised[skipped] = data_2d[skipped]
-    Sigma2[skipped] = float("nan")
-    P_out[skipped] = float("nan")
-    count[skipped] = 1
-    denoised /= count.unsqueeze(1)
-    Sigma2 /= count
-    P_out /= count
-
-    # SNR gain: sqrt(W*M / (P*(W + M - P)))
-    SNR_gain = torch.sqrt(
-        torch.tensor(float(W * M_meas), dtype=P_out.dtype, device=device)
-        / (P_out * (W + M_meas - P_out))
-    )
-
-    return (
-        denoised.reshape(dims),
-        Sigma2.reshape(dims_vox),
-        P_out.reshape(dims_vox),
-        SNR_gain.reshape(dims_vox),
-    )
 
 
 # ---------------------------------------------------------------------------
