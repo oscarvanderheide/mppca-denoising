@@ -12,6 +12,8 @@ single measurement dimension. All patches are denoised in parallel via batched S
 
 from __future__ import annotations
 
+import os
+import warnings
 from math import prod
 
 import numpy as np
@@ -249,18 +251,24 @@ def _denoise_patches(
     # Build gram matrix on the smaller dimension and decompose.
     # eigh on (K×K) >> SVD on (W×M) when W>>M or M>>W.
     # mH is the conjugate-transpose (= regular transpose for real inputs).
+    # For MPS, eigh is not yet implemented natively; we form the gram matrix on
+    # the device (Metal), move only the tiny (B, K, K) tensor to CPU for eigh,
+    # then move V (or U) back — keeping the heavy matmuls on the device.
+    eigh_device = torch.device("cpu") if device.type == "mps" else device
     if W >= M:
         # C = Xᵀ X  shape (B, M, M); V columns are right singular vectors
-        vals2, V = torch.linalg.eigh(patches.mH @ patches)
-        vals2 = vals2.flip(-1).clamp(min=0)   # (B, K) descending, non-negative
-        V = V.flip(-1)                          # (B, M, K)
-        XV = patches @ V                        # (B, W, K): col k ≈ U_k * s_k
+        gram = patches.mH @ patches  # on device
+        vals2, V = _eigh_safe(gram.to(eigh_device))
+        vals2 = vals2.flip(-1).clamp(min=0).to(device)  # (B, K) descending, non-negative
+        V = V.flip(-1).to(device)  # (B, M, K)
+        XV = patches @ V  # (B, W, K): col k ≈ U_k * s_k
     else:
         # C = X Xᵀ  shape (B, W, W); U columns are left singular vectors
-        vals2, U = torch.linalg.eigh(patches @ patches.mH)
-        vals2 = vals2.flip(-1).clamp(min=0)   # (B, K) descending
-        U = U.flip(-1)                          # (B, W, K)
-        XV = U.mH @ patches                    # (B, K, M): row k ≈ s_k * V_kᴴ
+        gram = patches @ patches.mH  # on device
+        vals2, U = _eigh_safe(gram.to(eigh_device))
+        vals2 = vals2.flip(-1).clamp(min=0).to(device)  # (B, K) descending
+        U = U.flip(-1).to(device)  # (B, W, K)
+        XV = U.mH @ patches  # (B, K, M): row k ≈ s_k * V_kᴴ
 
     if sigma2 is None:
         P_b, sigma2_b = _mp_estimate(vals2, W, M)
@@ -278,14 +286,32 @@ def _denoise_patches(
 
     # Per-component filter: filt_k = s_den_k / s_k  (safe divide)
     s = vals2.sqrt()
-    filt = s_den / s.masked_fill(s == 0, 1.0)   # (B, K)
+    filt = s_den / s.masked_fill(s == 0, 1.0)  # (B, K)
 
     if W >= M:
-        patches_den = (XV * filt.unsqueeze(1)) @ V.mH   # (B, W, M)
+        patches_den = (XV * filt.unsqueeze(1)) @ V.mH  # (B, W, M)
     else:
-        patches_den = U @ (XV * filt.unsqueeze(-1))      # (B, W, M)
+        patches_den = U @ (XV * filt.unsqueeze(-1))  # (B, W, M)
 
     return patches_den, sigma2_b, P_b
+
+
+def _eigh_safe(C: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """torch.linalg.eigh with CUDA sub-batching to avoid cuSOLVER batch limits.
+
+    cusolverDnXsyevBatched can emit CUSOLVER_STATUS_INVALID_VALUE for very large
+    batch sizes on some CUDA/cuSOLVER versions. Sub-batching in chunks keeps each
+    call well within tested limits while still running entirely on the GPU.
+    """
+    _CUDA_EIGH_CHUNK = 32768
+    if C.device.type != "cuda" or C.shape[0] <= _CUDA_EIGH_CHUNK:
+        return torch.linalg.eigh(C)
+    vals_chunks, vecs_chunks = [], []
+    for i in range(0, C.shape[0], _CUDA_EIGH_CHUNK):
+        v, V = torch.linalg.eigh(C[i : i + _CUDA_EIGH_CHUNK])
+        vals_chunks.append(v)
+        vecs_chunks.append(V)
+    return torch.cat(vals_chunks), torch.cat(vecs_chunks)
 
 
 def _mp_estimate(
@@ -375,8 +401,18 @@ def _prepare_inputs(data, window, mask, stride, device, dtype=None):
     if isinstance(device, str):
         device = torch.device(device)
 
+    if device.type == "mps":
+        # torch.linalg.eigh is not yet natively implemented on MPS (PyTorch 2.x).
+        # The heavy matmuls still run on Metal; only eigh is intercepted to CPU.
+        if not os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK"):
+            warnings.warn(
+                "MPS device: torch.linalg.eigh is not MPS-native and will run on "
+                "CPU. Matmuls still use Metal. Performance may be similar to CPU overall.",
+                stacklevel=3,
+            )
+
     if dtype is None:
-        if device.type == "cuda":
+        if device.type in ("cuda", "mps"):
             dtype = torch.complex64 if data.is_complex() else torch.float32
         else:
             dtype = data.dtype
