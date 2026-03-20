@@ -249,23 +249,29 @@ def _denoise_patches(
         )
 
     # Build gram matrix on the smaller dimension and decompose.
-    # eigh on (K×K) >> SVD on (W×M) when W>>M or M>>W.
+    # eigh on (K×K) << SVD on (W×M) when W>>M or M>>W.
     # mH is the conjugate-transpose (= regular transpose for real inputs).
-    # For MPS, eigh is not yet implemented natively; we form the gram matrix on
-    # the device (Metal), move only the tiny (B, K, K) tensor to CPU for eigh,
-    # then move V (or U) back — keeping the heavy matmuls on the device.
-    eigh_device = torch.device("cpu") if device.type == "mps" else device
+    #
+    # eigh is run on CPU in all cases:
+    #   - MPS: not yet natively implemented on Metal.
+    #   - CUDA: cusolverDnXsyevBatched (float32) is unreliable across cuSOLVER
+    #     versions and can emit CUSOLVER_STATUS_INVALID_VALUE for large batches.
+    # The gram matrices are tiny ((B, K, K), K=min(W,M)), so the host round-trip
+    # is negligible. All heavy matmuls (gram formation, reconstruction) stay on device.
+    eigh_device = torch.device("cpu") if device.type in ("mps", "cuda") else device
     if W >= M:
         # C = Xᵀ X  shape (B, M, M); V columns are right singular vectors
         gram = patches.mH @ patches  # on device
-        vals2, V = _eigh_safe(gram.to(eigh_device))
-        vals2 = vals2.flip(-1).clamp(min=0).to(device)  # (B, K) descending, non-negative
+        vals2, V = torch.linalg.eigh(gram.to(eigh_device))
+        vals2 = (
+            vals2.flip(-1).clamp(min=0).to(device)
+        )  # (B, K) descending, non-negative
         V = V.flip(-1).to(device)  # (B, M, K)
         XV = patches @ V  # (B, W, K): col k ≈ U_k * s_k
     else:
         # C = X Xᵀ  shape (B, W, W); U columns are left singular vectors
         gram = patches @ patches.mH  # on device
-        vals2, U = _eigh_safe(gram.to(eigh_device))
+        vals2, U = torch.linalg.eigh(gram.to(eigh_device))
         vals2 = vals2.flip(-1).clamp(min=0).to(device)  # (B, K) descending
         U = U.flip(-1).to(device)  # (B, W, K)
         XV = U.mH @ patches  # (B, K, M): row k ≈ s_k * V_kᴴ
@@ -294,24 +300,6 @@ def _denoise_patches(
         patches_den = U @ (XV * filt.unsqueeze(-1))  # (B, W, M)
 
     return patches_den, sigma2_b, P_b
-
-
-def _eigh_safe(C: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """torch.linalg.eigh with CUDA sub-batching to avoid cuSOLVER batch limits.
-
-    cusolverDnXsyevBatched can emit CUSOLVER_STATUS_INVALID_VALUE for very large
-    batch sizes on some CUDA/cuSOLVER versions. Sub-batching in chunks keeps each
-    call well within tested limits while still running entirely on the GPU.
-    """
-    _CUDA_EIGH_CHUNK = 32768
-    if C.device.type != "cuda" or C.shape[0] <= _CUDA_EIGH_CHUNK:
-        return torch.linalg.eigh(C)
-    vals_chunks, vecs_chunks = [], []
-    for i in range(0, C.shape[0], _CUDA_EIGH_CHUNK):
-        v, V = torch.linalg.eigh(C[i : i + _CUDA_EIGH_CHUNK])
-        vals_chunks.append(v)
-        vecs_chunks.append(V)
-    return torch.cat(vals_chunks), torch.cat(vecs_chunks)
 
 
 def _mp_estimate(
@@ -401,13 +389,15 @@ def _prepare_inputs(data, window, mask, stride, device, dtype=None):
     if isinstance(device, str):
         device = torch.device(device)
 
-    if device.type == "mps":
-        # torch.linalg.eigh is not yet natively implemented on MPS (PyTorch 2.x).
-        # The heavy matmuls still run on Metal; only eigh is intercepted to CPU.
-        if not os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK"):
+    if device.type in ("mps", "cuda"):
+        # eigh runs on CPU for both MPS (not natively implemented) and CUDA
+        # (cusolverDnXsyevBatched float32 is unreliable across cuSOLVER versions).
+        # The gram matrices are tiny so the host round-trip is negligible;
+        # all heavy matmuls stay on device.
+        if device.type == "mps" and not os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK"):
             warnings.warn(
-                "MPS device: torch.linalg.eigh is not MPS-native and will run on "
-                "CPU. Matmuls still use Metal. Performance may be similar to CPU overall.",
+                "MPS device: torch.linalg.eigh will run on CPU (not yet MPS-native). "
+                "Heavy matmuls still use Metal.",
                 stacklevel=3,
             )
 
