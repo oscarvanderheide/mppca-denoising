@@ -19,6 +19,12 @@ from math import prod
 import numpy as np
 import torch
 
+# Prefer cuSOLVER syevjBatched for all CUDA eigh calls — it is dramatically faster
+# for batched small matrices than the default heuristics (see PyTorch PR #175403).
+# Backend 3 = syevjBatched, which is a separate API from the xsyevBatched that
+# caused CUSOLVER_STATUS_INVALID_VALUE; it scales to large batch counts safely.
+os.environ.setdefault("TORCH_LINALG_EIGH_BACKEND", "3")
+
 
 def denoise_tensor(
     data: torch.Tensor | np.ndarray,
@@ -275,13 +281,14 @@ def _denoise_patches(
     # eigh on (K×K) << SVD on (W×M) when W>>M or M>>W.
     # mH is the conjugate-transpose (= regular transpose for real inputs).
     #
-    # eigh is run on CPU in all cases:
-    #   - MPS: not yet natively implemented on Metal.
-    #   - CUDA: cusolverDnXsyevBatched (float32) is unreliable across cuSOLVER
-    #     versions and can emit CUSOLVER_STATUS_INVALID_VALUE for large batches.
-    # The gram matrices are tiny ((B, K, K), K=min(W,M)), so the host round-trip
-    # is negligible. All heavy matmuls (gram formation, reconstruction) stay on device.
-    eigh_device = torch.device("cpu") if device.type in ("mps", "cuda") else device
+    # eigh device selection:
+    #   - MPS: not yet natively implemented on Metal, must use CPU.
+    #   - CUDA: runs on GPU using syevjBatched (forced via TORCH_LINALG_EIGH_BACKEND=3
+    #     set at module import). ~25x faster than the default syevd heuristic for
+    #     batched small matrices (PyTorch PR #175403). Uses a 32-bit Jacobi API that
+    #     does not have the batch-count limits of xsyevBatched (syevd).
+    #   - CPU: runs on device directly.
+    eigh_device = torch.device("cpu") if device.type == "mps" else device
     if W >= M:
         # C = Xᵀ X  shape (B, M, M); V columns are right singular vectors
         gram = patches.mH @ patches  # on device
