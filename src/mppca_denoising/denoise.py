@@ -87,9 +87,9 @@ def denoise_tensor(
 
     # --- Accumulators ---
     denoised = torch.zeros_like(data_2d)
-    count = torch.zeros(num_vox, dtype=dtype, device=device)
-    Sigma2 = torch.zeros(num_vox, dtype=dtype, device=device)
-    P_out = torch.zeros(num_vox, dtype=dtype, device=device)
+    count = torch.zeros(num_vox, dtype=torch.float64, device=device)
+    Sigma2 = torch.zeros(num_vox, dtype=torch.float64, device=device)
+    P_out = torch.zeros(num_vox, dtype=torch.float64, device=device)
 
     # --- Mini-batch loop ---
     # Patch index matrices are built on-the-fly per batch to bound peak memory,
@@ -120,10 +120,10 @@ def denoise_tensor(
                 0, c_inds.unsqueeze(1).expand(-1, M_meas), patches_den[:, centre_ind, :]
             )
             count.scatter_add_(
-                0, c_inds, torch.ones(len(c_inds), dtype=dtype, device=device)
+                0, c_inds, torch.ones(len(c_inds), dtype=torch.float64, device=device)
             )
             Sigma2.scatter_add_(0, c_inds, s2_b)
-            P_out.scatter_add_(0, c_inds, p_b.to(dtype))
+            P_out.scatter_add_(0, c_inds, p_b.to(torch.float64))
         else:
             flat_inds = vox_inds_b.reshape(-1)  # (B'*W,)
             denoised.scatter_add_(
@@ -132,13 +132,13 @@ def denoise_tensor(
                 patches_den.reshape(-1, M_meas),
             )
             count.scatter_add_(
-                0, flat_inds, torch.ones(len(flat_inds), dtype=dtype, device=device)
+                0, flat_inds, torch.ones(len(flat_inds), dtype=torch.float64, device=device)
             )
             Sigma2.scatter_add_(
                 0, flat_inds, s2_b.unsqueeze(1).expand(-1, W).reshape(-1)
             )
             P_out.scatter_add_(
-                0, flat_inds, p_b.to(dtype).unsqueeze(1).expand(-1, W).reshape(-1)
+                0, flat_inds, p_b.to(torch.float64).unsqueeze(1).expand(-1, W).reshape(-1)
             )
 
         n_done += len(corners_b)
@@ -162,7 +162,7 @@ def denoise_tensor(
 
     # SNR gain: sqrt(W*M / (P*(W + M - P)))
     SNR_gain = torch.sqrt(
-        torch.tensor(float(W * M_meas), dtype=dtype, device=device)
+        torch.tensor(float(W * M_meas), dtype=torch.float64, device=device)
         / (P_out * (W + M_meas - P_out))
     )
 
@@ -198,23 +198,24 @@ def _denoise_patches(
         P_b: (B,) signal component count per patch (long).
     """
     B, W, M = patches.shape
-    dtype, device = patches.dtype, patches.device
+    device = patches.device
 
     if min(W, M) == 1:
         return (
             patches.clone(),
-            torch.zeros(B, dtype=dtype, device=device),
+            torch.zeros(B, dtype=torch.float64, device=device),
             torch.ones(B, dtype=torch.long, device=device),
         )
 
     U, s, Vh = torch.linalg.svd(patches, full_matrices=False)  # (B,W,K), (B,K), (B,K,M)
+    # s is always real even for complex input
     K = s.shape[1]
     vals2 = s**2  # (B, K)
 
     if sigma2 is None:
         P_b, sigma2_b = _mp_estimate(vals2, W, M)
     else:
-        sigma2_b = torch.full((B,), sigma2, dtype=dtype, device=device)
+        sigma2_b = torch.full((B,), sigma2, dtype=vals2.dtype, device=device)
         cutoff = sigma2 * (W**0.5 + M**0.5) ** 2
         P_b = (vals2 > cutoff).sum(1).to(torch.long)
 
@@ -223,7 +224,7 @@ def _denoise_patches(
     if opt_shrink:
         s_den = _opt_shrink_batched(vals2, P_b, sigma2_b, W, M, comp_mask)
     else:
-        s_den = s * comp_mask.to(dtype)
+        s_den = s * comp_mask.to(s.dtype)
 
     patches_den = (U * s_den.unsqueeze(1)) @ Vh
     return patches_den, sigma2_b, P_b
@@ -297,8 +298,8 @@ def _opt_shrink_batched(
         + (M_eff - N_eff) ** 2 * s2**2 / vals2_safe
     )
 
-    cdtype = torch.complex128 if vals2.dtype == torch.float64 else torch.complex64
-    s_den = torch.real(torch.sqrt(shrunk.to(cdtype))).to(vals2.dtype)
+    # Negative shrunk values mean the component is noise-level — clamp to 0.
+    s_den = shrunk.clamp(min=0).sqrt()
     s_den = s_den * comp_mask.to(vals2.dtype)
     return s_den
 
@@ -312,8 +313,8 @@ def _prepare_inputs(data, window, mask, stride, device):
     if isinstance(data, np.ndarray):
         data = torch.from_numpy(data.copy())
     if device is None:
-        device = data.device if data.is_cuda else torch.device("cpu")
-    dtype = torch.float64
+        device = data.device if data.device.type != "cpu" else torch.device("cpu")
+    dtype = torch.complex128 if data.is_complex() else torch.float64
     data = data.to(dtype=dtype, device=device)
 
     window = list(window)

@@ -1,5 +1,5 @@
 [project]
-name = "mp-pca-tensor-denoising"
+name = "mppca-denoising"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
