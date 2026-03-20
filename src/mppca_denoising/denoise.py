@@ -79,7 +79,9 @@ def denoise_tensor(
         win_strides = _c_strides(tuple(window), device)
 
         # Linear offsets of every voxel within a (window-shaped) patch
-        window_subs = _ind2sub_c(window, torch.arange(W, device=device))  # (W, n_spatial)
+        window_subs = _ind2sub_c(
+            window, torch.arange(W, device=device)
+        )  # (W, n_spatial)
         index_increments = (window_subs * sp_strides).sum(1)  # (W,)
 
         # Centre voxel: C-order position within the W-element window array
@@ -93,7 +95,9 @@ def denoise_tensor(
         win_t = torch.tensor(window, device=device)
         dim_t = torch.tensor(list(dims_vox), device=device)
         str_t = torch.tensor(stride, device=device)
-        geom_valid = ((all_subs + win_t) <= dim_t).all(1) & (all_subs % str_t == 0).all(1)
+        geom_valid = ((all_subs + win_t) <= dim_t).all(1) & (all_subs % str_t == 0).all(
+            1
+        )
         valid_corners = torch.where(geom_valid)[0]  # (N_corners,)
         N_corners = len(valid_corners)
 
@@ -115,7 +119,9 @@ def denoise_tensor(
         n_done = 0
         for b_start in range(0, N_corners, batch_size):
             corners_b = valid_corners[b_start : b_start + batch_size]
-            vox_inds_b = corners_b.unsqueeze(1) + index_increments.unsqueeze(0)  # (B, W)
+            vox_inds_b = corners_b.unsqueeze(1) + index_increments.unsqueeze(
+                0
+            )  # (B, W)
 
             # Mask filter
             if center_assign:
@@ -136,7 +142,9 @@ def denoise_tensor(
             if center_assign:
                 c_inds = vox_inds_b[:, centre_ind]  # (B',)
                 denoised.scatter_add_(
-                    0, c_inds.unsqueeze(1).expand(-1, M_meas), patches_den[:, centre_ind, :]
+                    0,
+                    c_inds.unsqueeze(1).expand(-1, M_meas),
+                    patches_den[:, centre_ind, :],
                 )
                 count.scatter_add_(
                     0, c_inds, torch.ones(len(c_inds), dtype=count.dtype, device=device)
@@ -208,7 +216,13 @@ def _denoise_patches(
     opt_shrink: bool,
     sigma2: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """MP-PCA denoise a batch of (W × M) patches via batched SVD.
+    """MP-PCA denoise a batch of (W × M) patches via batched eigendecomposition.
+
+    Forms the smaller (K×K, K=min(W,M)) gram matrix and uses eigh instead of a
+    full SVD on the (W×M) patch matrix. For typical MRI patches W>>M (e.g. 125
+    voxels × 5 measurements), this reduces the eigenproblem from (125×5) SVD to
+    a (5×5) eigh, which is far cheaper, especially on GPU where batched matmuls
+    (used to form the gram matrix and reconstruct) are highly optimised by cuBLAS.
 
     Args:
         patches: (B, W, M) float tensor.
@@ -222,18 +236,31 @@ def _denoise_patches(
     """
     B, W, M = patches.shape
     device = patches.device
+    real_dtype = patches.real.dtype if patches.is_complex() else patches.dtype
+    K = min(W, M)
 
-    if min(W, M) == 1:
+    if K == 1:
         return (
             patches.clone(),
-            torch.zeros(B, dtype=vals2.dtype, device=device),
+            torch.zeros(B, dtype=real_dtype, device=device),
             torch.ones(B, dtype=torch.long, device=device),
         )
 
-    U, s, Vh = torch.linalg.svd(patches, full_matrices=False)  # (B,W,K), (B,K), (B,K,M)
-    # s is always real even for complex input
-    K = s.shape[1]
-    vals2 = s**2  # (B, K)
+    # Build gram matrix on the smaller dimension and decompose.
+    # eigh on (K×K) >> SVD on (W×M) when W>>M or M>>W.
+    # mH is the conjugate-transpose (= regular transpose for real inputs).
+    if W >= M:
+        # C = Xᵀ X  shape (B, M, M); V columns are right singular vectors
+        vals2, V = torch.linalg.eigh(patches.mH @ patches)
+        vals2 = vals2.flip(-1).clamp(min=0)   # (B, K) descending, non-negative
+        V = V.flip(-1)                          # (B, M, K)
+        XV = patches @ V                        # (B, W, K): col k ≈ U_k * s_k
+    else:
+        # C = X Xᵀ  shape (B, W, W); U columns are left singular vectors
+        vals2, U = torch.linalg.eigh(patches @ patches.mH)
+        vals2 = vals2.flip(-1).clamp(min=0)   # (B, K) descending
+        U = U.flip(-1)                          # (B, W, K)
+        XV = U.mH @ patches                    # (B, K, M): row k ≈ s_k * V_kᴴ
 
     if sigma2 is None:
         P_b, sigma2_b = _mp_estimate(vals2, W, M)
@@ -247,9 +274,17 @@ def _denoise_patches(
     if opt_shrink:
         s_den = _opt_shrink_batched(vals2, P_b, sigma2_b, W, M, comp_mask)
     else:
-        s_den = s * comp_mask.to(s.dtype)
+        s_den = vals2.sqrt() * comp_mask.to(vals2.dtype)
 
-    patches_den = (U * s_den.unsqueeze(1)) @ Vh
+    # Per-component filter: filt_k = s_den_k / s_k  (safe divide)
+    s = vals2.sqrt()
+    filt = s_den / s.masked_fill(s == 0, 1.0)   # (B, K)
+
+    if W >= M:
+        patches_den = (XV * filt.unsqueeze(1)) @ V.mH   # (B, W, M)
+    else:
+        patches_den = U @ (XV * filt.unsqueeze(-1))      # (B, W, M)
+
     return patches_den, sigma2_b, P_b
 
 
