@@ -71,8 +71,8 @@ def denoise_tensor(
     n_spatial = len(window)
     spatial_shape = data.shape[:n_spatial]
     meas_shape = tuple(data.shape[n_spatial:])  # shape of per-voxel measurement tensor
-    n_meas = prod(meas_shape)                   # total measurements per voxel
-    patch_size = prod(window)                   # W: voxels per patch
+    n_meas = prod(meas_shape)  # total measurements per voxel
+    patch_size = prod(window)  # W: voxels per patch
     n_vox = prod(spatial_shape)
 
     # Flatten spatial dims so every voxel is a row — patch extraction becomes a single index op.
@@ -100,7 +100,9 @@ def denoise_tensor(
     n_done = 0
     for b_start in range(0, n_patches, batch_size):
         corners_b = patch_corners[b_start : b_start + batch_size]
-        vox_inds = corners_b.unsqueeze(1) + patch_offsets.unsqueeze(0)  # (B, patch_size)
+        vox_inds = corners_b.unsqueeze(1) + patch_offsets.unsqueeze(
+            0
+        )  # (B, patch_size)
 
         # Skip patches that contain no masked voxels.
         active = (
@@ -292,19 +294,19 @@ def _denoise_patches(
         M = n_meas
         # Gram matrix on the smaller dimension.
         if W >= M:
-            gram = patches.mH @ patches   # (B, M, M)
+            gram = patches.mH @ patches  # (B, M, M)
         else:
-            gram = patches @ patches.mH   # (B, W, W)
+            gram = patches @ patches.mH  # (B, W, W)
         K = min(W, M)
-        sq_sv, evecs = torch.linalg.eigh(gram)           # ascending
-        sq_sv = sq_sv.flip(-1).clamp(min=0)[:, :K]       # descending (B, K)
-        evecs = evecs.flip(-1)[:, :, :K]                  # (B, min_dim, K)
+        sq_sv, evecs = torch.linalg.eigh(gram)  # ascending
+        sq_sv = sq_sv.flip(-1).clamp(min=0)[:, :K]  # descending (B, K)
+        evecs = evecs.flip(-1)[:, :, :K]  # (B, min_dim, K)
 
         if sigma2 is None:
             n_signal_b, sigma2_b = _mp_estimate(sq_sv, W, M)
         else:
             sigma2_b = torch.full((B,), sigma2, dtype=real_dtype, device=device)
-            cutoff = sigma2_b * (W ** 0.5 + M ** 0.5) ** 2
+            cutoff = sigma2_b * (W**0.5 + M**0.5) ** 2
             n_signal_b = (sq_sv > cutoff.unsqueeze(1)).sum(1).to(torch.long)
 
         max_P = int(n_signal_b.max().item())
@@ -313,8 +315,8 @@ def _denoise_patches(
             return denoised, sigma2_b, n_signal_b
 
         # Zero-mask components beyond each patch's P.
-        keep = (
-            torch.arange(max_P, device=device).unsqueeze(0) < n_signal_b.unsqueeze(1)
+        keep = torch.arange(max_P, device=device).unsqueeze(0) < n_signal_b.unsqueeze(
+            1
         )  # (B, max_P)
 
         if W >= M:
@@ -326,16 +328,16 @@ def _denoise_patches(
                 shrunk = _opt_shrink_batched(
                     sq_sv[:, :max_P], n_signal_b, sigma2_b, W, M, signal_mask
                 )  # (B, max_P) shrunk singular values
-                orig_sv = sq_sv[:, :max_P].sqrt().masked_fill(
-                    sq_sv[:, :max_P] == 0, 1.0
+                orig_sv = (
+                    sq_sv[:, :max_P].sqrt().masked_fill(sq_sv[:, :max_P] == 0, 1.0)
                 )
                 scale = (shrunk / orig_sv) * keep.to(sq_sv.dtype)  # (B, max_P)
                 # X_rec = patches @ V_P @ diag(scale) @ V_P.H
-                XV = patches @ V_P          # (B, W, max_P)
-                denoised = (XV * scale.unsqueeze(1)) @ V_P.mH   # (B, W, M)
+                XV = patches @ V_P  # (B, W, max_P)
+                denoised = (XV * scale.unsqueeze(1)) @ V_P.mH  # (B, W, M)
             else:
                 V_P_masked = V_P * keep.to(V_P.dtype).unsqueeze(1)  # (B, M, max_P)
-                denoised = patches @ (V_P_masked @ V_P_masked.mH)   # (B, W, M)
+                denoised = patches @ (V_P_masked @ V_P_masked.mH)  # (B, W, M)
         else:
             # evecs are U (left singular vectors), shape (B, W, K).
             U_P = evecs[:, :, :max_P]  # (B, W, max_P)
@@ -344,15 +346,15 @@ def _denoise_patches(
                 shrunk = _opt_shrink_batched(
                     sq_sv[:, :max_P], n_signal_b, sigma2_b, W, M, signal_mask
                 )
-                orig_sv = sq_sv[:, :max_P].sqrt().masked_fill(
-                    sq_sv[:, :max_P] == 0, 1.0
+                orig_sv = (
+                    sq_sv[:, :max_P].sqrt().masked_fill(sq_sv[:, :max_P] == 0, 1.0)
                 )
                 scale = (shrunk / orig_sv) * keep.to(sq_sv.dtype)
-                UX = U_P.mH @ patches     # (B, max_P, M)
-                denoised = (U_P * scale.unsqueeze(2)) @ UX   # (B, W, M)
+                UX = U_P.mH @ patches  # (B, max_P, M)
+                denoised = (U_P * scale.unsqueeze(2)) @ UX  # (B, W, M)
             else:
                 U_P_masked = U_P * keep.to(U_P.dtype).unsqueeze(2)
-                denoised = (U_P_masked @ U_P_masked.mH) @ patches   # (B, W, M)
+                denoised = (U_P_masked @ U_P_masked.mH) @ patches  # (B, W, M)
 
         return denoised, sigma2_b, n_signal_b
 
@@ -372,7 +374,9 @@ def _denoise_patches(
     # get initial noise estimate.  Then combine all estimates into one sigma2.
     # ------------------------------------------------------------------
     if sigma2 is None:
-        modal_sv: list[tuple[torch.Tensor, int, int]] = []  # (sq_singvals, M, N) per mode
+        modal_sv: list[
+            tuple[torch.Tensor, int, int]
+        ] = []  # (sq_singvals, M, N) per mode
         for n in range(num_modes):
             Xn, Mn, Nn = _mode_unfold(X, n, dims)
             sq_sv, _ = _eigh_descending(Xn, Mn, Nn)
@@ -387,10 +391,9 @@ def _denoise_patches(
         denom = torch.zeros(B, dtype=real_dtype, device=device)
         for (sq_sv, Mn, Nn), P_n in zip(modal_sv, P_init):
             # Tail energy: sum of eigenvalues that are noise (index >= P_n).
-            signal_mask = (
-                torch.arange(sq_sv.shape[1], device=device).unsqueeze(0)
-                < P_n.unsqueeze(1)
-            )
+            signal_mask = torch.arange(sq_sv.shape[1], device=device).unsqueeze(
+                0
+            ) < P_n.unsqueeze(1)
             tail = sq_sv.masked_fill(signal_mask, 0.0).sum(1)
             numer += tail
             denom += ((Mn - P_n) * (Nn - P_n)).clamp(min=1).to(real_dtype)
@@ -416,7 +419,7 @@ def _denoise_patches(
     # After mode n: X (unfolded) ← U_n^H @ X_n  (the "passed-forward" part).
     # The Tucker core X shrinks along mode n from dims[n] to P_n.
     # ------------------------------------------------------------------
-    cur_dims = list(dims)   # tracks current (possibly reduced) size per mode
+    cur_dims = list(dims)  # tracks current (possibly reduced) size per mode
     U_list: list[tuple[torch.Tensor, int]] = []  # (U_n, orig_Mn) per mode
 
     for n in range(num_modes):
@@ -428,7 +431,9 @@ def _denoise_patches(
         if max_P == 0 or Mn == 0 or Nn == 0:
             # All patches are pure noise at this mode.
             X = torch.zeros_like(X)
-            U_list.append((torch.zeros(B, Mn, 0, dtype=patches.dtype, device=device), Mn))
+            U_list.append(
+                (torch.zeros(B, Mn, 0, dtype=patches.dtype, device=device), Mn)
+            )
             cur_dims[n] = 0
             break
 
@@ -440,8 +445,8 @@ def _denoise_patches(
         Xn_reduced = U_n.mH @ Xn  # (B, max_P, Nn)
 
         # Zero out components beyond each patch's own P_n.
-        keep = (
-            torch.arange(max_P, device=device).unsqueeze(0) < P_n.unsqueeze(1)
+        keep = torch.arange(max_P, device=device).unsqueeze(0) < P_n.unsqueeze(
+            1
         )  # (B, max_P)
         Xn_reduced = Xn_reduced * keep.to(Xn_reduced.dtype).unsqueeze(2)
 
@@ -463,10 +468,12 @@ def _denoise_patches(
         if Kl > 1:
             P_last = P_all[n_last]
             sq_sv_l, evecs_l = _eigh_descending(Xl, Ml, Nl)
-            signal_mask_l = (
-                torch.arange(Kl, device=device).unsqueeze(0) < P_last.unsqueeze(1)
+            signal_mask_l = torch.arange(Kl, device=device).unsqueeze(
+                0
+            ) < P_last.unsqueeze(1)
+            shrunk_l = _opt_shrink_batched(
+                sq_sv_l, P_last, sigma2_b, Ml, Nl, signal_mask_l
             )
-            shrunk_l = _opt_shrink_batched(sq_sv_l, P_last, sigma2_b, Ml, Nl, signal_mask_l)
             orig_sv_l = sq_sv_l.sqrt()
             scale_l = shrunk_l / orig_sv_l.masked_fill(orig_sv_l == 0, 1.0)  # (B, Kl)
 
@@ -502,7 +509,9 @@ def _denoise_patches(
             zero_shape = [B, orig_Mn] + rest
             X = _mode_refold(
                 torch.zeros(zero_shape, dtype=patches.dtype, device=device),
-                n, cur_dims, num_modes,
+                n,
+                cur_dims,
+                num_modes,
             )
             continue
 
@@ -572,10 +581,10 @@ def _eigh_descending(
     """
     K = min(Mn, Nn)
     if Mn <= Nn:
-        gram = Xn @ Xn.mH           # (B, Mn, Mn)
+        gram = Xn @ Xn.mH  # (B, Mn, Mn)
         sq_sv, evecs = torch.linalg.eigh(gram)
     else:
-        gram = Xn.mH @ Xn           # (B, Nn, Nn)
+        gram = Xn.mH @ Xn  # (B, Nn, Nn)
         sq_sv, evecs = torch.linalg.eigh(gram)
     sq_sv = sq_sv.flip(-1).clamp(min=0)[:, :K]
     evecs = evecs.flip(-1)[:, :, :K]
@@ -597,15 +606,15 @@ def _left_singular_vecs(
     Returns U: (B, Mn, max_P).
     """
     if Mn <= Nn:
-        gram = Xn @ Xn.mH            # (B, Mn, Mn)
+        gram = Xn @ Xn.mH  # (B, Mn, Mn)
         _, evecs = torch.linalg.eigh(gram)
         U = evecs.flip(-1)[:, :, :max_P]
     else:
-        gram = Xn.mH @ Xn            # (B, Nn, Nn)
+        gram = Xn.mH @ Xn  # (B, Nn, Nn)
         _, evecs = torch.linalg.eigh(gram)
-        V = evecs.flip(-1)[:, :, :max_P]   # (B, Nn, max_P) right singular vecs
-        US = Xn @ V                        # (B, Mn, max_P) ≈ U * Σ  (unnormalised)
-        U, _ = torch.linalg.qr(US)        # (B, Mn, max_P) orthonormal left vecs
+        V = evecs.flip(-1)[:, :, :max_P]  # (B, Nn, max_P) right singular vecs
+        US = Xn @ V  # (B, Mn, max_P) ≈ U * Σ  (unnormalised)
+        U, _ = torch.linalg.qr(US)  # (B, Mn, max_P) orthonormal left vecs
     return U
 
 
@@ -647,7 +656,7 @@ def _mp_estimate(
 
     # The first eigenvalue that falls below the cutoff marks where noise starts.
     below_cutoff = sq_singvals < mp_cutoff  # (B, K)
-    any_below = below_cutoff.any(1)         # (B,)
+    any_below = below_cutoff.any(1)  # (B,)
     n_signal = torch.where(
         any_below,
         below_cutoff.long().argmax(1),
