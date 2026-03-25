@@ -1,11 +1,11 @@
 # mppca-denoising
 
-MP-PCA denoising for MRI data ([Olesen et al., MRM 2022](https://doi.org/10.1002/mrm.29478)).
+MP-PCA denoising for MRI data ([Olesen et al., MRM 2022](https://doi.org/10.1002/mrm.29478)). PyTorch port of https://github.com/Neurophysics-CFIN/Tensor-MP-PCA. Not (yet) registered in PyPI.
 
 ## Install
 
 ```bash
-pip install git+https://github.com/oscarvanderheide/mppca-denoising
+uv add git+https://github.com/oscarvanderheide/mppca-denoising
 ```
 
 
