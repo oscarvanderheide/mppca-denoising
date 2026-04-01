@@ -379,7 +379,7 @@ def _denoise_patches(
         ] = []  # (sq_singvals, M, N) per mode
         for n in range(num_modes):
             Xn, Mn, Nn = _mode_unfold(X, n, dims)
-            sq_sv, _ = _eigh_descending(Xn, Mn, Nn)
+            sq_sv = _eigvalsh_descending(Xn, Mn, Nn)
             modal_sv.append((sq_sv, Mn, Nn))
 
         # Initial per-mode P via individual MP estimates.
@@ -410,7 +410,7 @@ def _denoise_patches(
         P_all = []
         for n in range(num_modes):
             Xn, Mn, Nn = _mode_unfold(X, n, dims)
-            sq_sv, _ = _eigh_descending(Xn, Mn, Nn)
+            sq_sv = _eigvalsh_descending(Xn, Mn, Nn)
             cutoff = sigma2_b * (Mn**0.5 + Nn**0.5) ** 2
             P_all.append((sq_sv > cutoff.unsqueeze(1)).sum(1).to(torch.long))
 
@@ -568,6 +568,26 @@ def _mode_refold(
     return Xn.reshape(shape_perm).permute(perm_inv)
 
 
+def _eigvalsh_descending(
+    Xn: torch.Tensor,
+    Mn: int,
+    Nn: int,
+) -> torch.Tensor:
+    """Eigenvalues only (no eigenvectors) of the smaller gram matrix of Xn.
+
+    Faster than _eigh_descending when eigenvectors are not needed.
+
+    Returns sq_singvals: (B, K) squared singular values in descending order.
+    """
+    K = min(Mn, Nn)
+    if Mn <= Nn:
+        gram = Xn @ Xn.mH  # (B, Mn, Mn)
+    else:
+        gram = Xn.mH @ Xn  # (B, Nn, Nn)
+    sq_sv = torch.linalg.eigvalsh(gram)
+    return sq_sv.flip(-1).clamp(min=0)[:, :K]
+
+
 def _eigh_descending(
     Xn: torch.Tensor,
     Mn: int,
@@ -601,7 +621,7 @@ def _left_singular_vecs(
 
     When Mn <= Nn: left vecs = eigenvectors of Xn @ Xn^H (exact).
     When Mn > Nn:  compute right vecs via Xn^H @ Xn, then derive left vecs
-                   by orthogonalising Xn @ V (QR).
+                   by normalising Xn @ V (columns are already orthogonal).
 
     Returns U: (B, Mn, max_P).
     """
@@ -613,8 +633,10 @@ def _left_singular_vecs(
         gram = Xn.mH @ Xn  # (B, Nn, Nn)
         _, evecs = torch.linalg.eigh(gram)
         V = evecs.flip(-1)[:, :, :max_P]  # (B, Nn, max_P) right singular vecs
-        US = Xn @ V  # (B, Mn, max_P) ≈ U * Σ  (unnormalised)
-        U, _ = torch.linalg.qr(US)  # (B, Mn, max_P) orthonormal left vecs
+        US = Xn @ V  # (B, Mn, max_P) = U * Σ  (columns are orthogonal)
+        # Columns of US are already orthogonal (U*Σ), just normalise to get U.
+        norms = US.norm(dim=1, keepdim=True).clamp(min=1e-30)
+        U = US / norms
     return U
 
 
