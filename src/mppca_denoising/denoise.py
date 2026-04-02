@@ -38,7 +38,7 @@ def denoise_tensor(
     sigma2: float | None = None,
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
-    batch_size: int = 4096,
+    batch_size: int = 8192,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Denoise MRI data of shape (*spatial_dims, M) using tMPPCA.
 
@@ -93,7 +93,10 @@ def denoise_tensor(
     denoised_acc = torch.zeros_like(data_flat)
     count_acc = torch.zeros(n_vox, dtype=real_dtype, device=device)
     sigma2_acc = torch.zeros(n_vox, dtype=real_dtype, device=device)
-    n_signal_acc = torch.zeros(n_vox, dtype=real_dtype, device=device)
+    # p_all_acc: per-mode signal rank accumulator used for SNR_gain and n_signal output.
+    # Shape (n_vox, 1) for 1-dir; (n_vox, 1+len(meas_shape)) for Tucker.
+    n_modes_return = 1 if len(meas_shape) == 1 else len(meas_shape) + 1
+    p_all_acc = torch.zeros(n_vox, n_modes_return, dtype=real_dtype, device=device)
 
     # Denoise patches in mini-batches and scatter-accumulate the results.
     # Building index tensors per batch bounds peak memory.
@@ -116,7 +119,7 @@ def denoise_tensor(
         vox_inds = vox_inds[active]
 
         patches = data_flat[vox_inds]  # (B, patch_size, n_meas)
-        denoised_patches, sigma2_b, n_signal_b = _denoise_patches(
+        denoised_patches, sigma2_b, p_all_b = _denoise_patches(
             patches, meas_shape=meas_shape, opt_shrink=opt_shrink, sigma2=sigma2
         )
 
@@ -134,7 +137,11 @@ def denoise_tensor(
                 torch.ones(len(centre_inds), dtype=real_dtype, device=device),
             )
             sigma2_acc.scatter_add_(0, centre_inds, sigma2_b)
-            n_signal_acc.scatter_add_(0, centre_inds, n_signal_b.to(real_dtype))
+            p_all_acc.scatter_add_(
+                0,
+                centre_inds.unsqueeze(1).expand(-1, n_modes_return),
+                p_all_b.to(real_dtype),
+            )
         else:
             # Accumulate every voxel's denoised estimate from all patches it belongs to.
             flat_inds = vox_inds.reshape(-1)
@@ -151,13 +158,13 @@ def denoise_tensor(
             sigma2_acc.scatter_add_(
                 0, flat_inds, sigma2_b.unsqueeze(1).expand(-1, patch_size).reshape(-1)
             )
-            n_signal_acc.scatter_add_(
+            p_all_acc.scatter_add_(
                 0,
-                flat_inds,
-                n_signal_b.to(real_dtype)
+                flat_inds.unsqueeze(1).expand(-1, n_modes_return),
+                p_all_b.to(real_dtype)
                 .unsqueeze(1)
-                .expand(-1, patch_size)
-                .reshape(-1),
+                .expand(-1, patch_size, -1)
+                .reshape(-1, n_modes_return),
             )
 
         n_done += len(corners_b)
@@ -174,22 +181,36 @@ def denoise_tensor(
     unvisited = count_acc == 0
     denoised_acc[unvisited] = data_flat[unvisited]
     sigma2_acc[unvisited] = float("nan")
-    n_signal_acc[unvisited] = float("nan")
+    p_all_acc[unvisited] = float("nan")
     count_acc[unvisited] = 1
     denoised_acc /= count_acc.unsqueeze(1)
     sigma2_acc /= count_acc
-    n_signal_acc /= count_acc
+    p_all_acc /= count_acc.unsqueeze(1)
 
-    # Theoretical SNR gain: sqrt(W*M / (P*(W + M - P)))  (Olesen et al., Eq. 6).
-    snr_gain = torch.sqrt(
-        torch.tensor(float(patch_size * n_meas), dtype=real_dtype, device=device)
-        / (n_signal_acc * (patch_size + n_meas - n_signal_acc))
-    )
+    # SNR gain formula matching MATLAB's denoise_recursive_tensor.
+    # 1-dir:  sqrt(W*M / (P*(W+M-P)))
+    # Tucker: sqrt(prod(modal_sizes) / (prod(P_k) + sum((sz_k-P_k)*P_k)))
+    if n_modes_return == 1:
+        p0 = p_all_acc[:, 0]
+        snr_gain = torch.sqrt(
+            torch.tensor(float(patch_size * n_meas), dtype=real_dtype, device=device)
+            / (p0 * (patch_size + n_meas - p0))
+        )
+    else:
+        modal_sizes = torch.tensor(
+            [float(patch_size)] + [float(m) for m in meas_shape],
+            dtype=real_dtype,
+            device=device,
+        )
+        total_size = modal_sizes.prod()
+        prod_p = p_all_acc.prod(dim=1)
+        sum_noise = ((modal_sizes.unsqueeze(0) - p_all_acc) * p_all_acc).sum(dim=1)
+        snr_gain = torch.sqrt(total_size / (prod_p + sum_noise))
 
     return (
         denoised_acc.reshape(data.shape),
         sigma2_acc.reshape(spatial_shape),
-        n_signal_acc.reshape(spatial_shape),
+        p_all_acc.reshape(spatial_shape + (n_modes_return,)).squeeze(-1),
         snr_gain.reshape(spatial_shape),
     )
 
@@ -298,7 +319,7 @@ def _denoise_patches(
         else:
             gram = patches @ patches.mH  # (B, W, W)
         K = min(W, M)
-        sq_sv, evecs = torch.linalg.eigh(gram)  # ascending
+        sq_sv, evecs = _safe_eigh(gram)  # ascending
         sq_sv = sq_sv.flip(-1).clamp(min=0)[:, :K]  # descending (B, K)
         evecs = evecs.flip(-1)[:, :, :K]  # (B, min_dim, K)
 
@@ -312,7 +333,7 @@ def _denoise_patches(
         max_P = int(n_signal_b.max().item())
         if max_P == 0:
             denoised = torch.zeros_like(patches)
-            return denoised, sigma2_b, n_signal_b
+            return denoised, sigma2_b, n_signal_b.unsqueeze(1)
 
         # Zero-mask components beyond each patch's P.
         keep = torch.arange(max_P, device=device).unsqueeze(0) < n_signal_b.unsqueeze(
@@ -356,7 +377,7 @@ def _denoise_patches(
                 U_P_masked = U_P * keep.to(U_P.dtype).unsqueeze(2)
                 denoised = (U_P_masked @ U_P_masked.mH) @ patches  # (B, W, M)
 
-        return denoised, sigma2_b, n_signal_b
+        return denoised, sigma2_b, n_signal_b.unsqueeze(1)
 
     # ------------------------------------------------------------------
     # Multi measurement-mode path: Tucker sequential (tMPPCA).
@@ -423,10 +444,31 @@ def _denoise_patches(
     U_list: list[tuple[torch.Tensor, int]] = []  # (U_n, orig_Mn) per mode
 
     for n in range(num_modes):
-        P_n = P_all[n]
-        max_P = int(P_n.max().item())
-
         Xn, Mn, Nn = _mode_unfold(X, n, cur_dims)
+
+        # For modes n>0 MATLAB recomputes P from the compressed matrix SVD
+        # (dimensions Mn × Nn of the Tucker core, not the original unfolding).
+        # Replicating this: always call _eigh_descending for n>0 so we get both
+        # fresh P estimates and the eigenvectors needed for projection.
+        if n > 0:
+            sq_sv, evecs = _eigh_descending(Xn, Mn, Nn)
+            # Per-element effective Nn: product of actual ranks for all other modes.
+            # Modes m<n are already compressed (use P_all[m]); modes m>n are not yet
+            # compressed (use original dims[m]).  This matches MATLAB, which processes
+            # one patch at a time and always uses the exact compressed matrix size.
+            Nn_eff = torch.ones(B, dtype=real_dtype, device=device)
+            for m in range(num_modes):
+                if m == n:
+                    continue
+                Nn_eff = Nn_eff * (P_all[m].to(real_dtype) if m < n else float(dims[m]))
+            cutoff = sigma2_b * (float(Mn) ** 0.5 + Nn_eff**0.5) ** 2  # (B,)
+            P_n = (sq_sv > cutoff.unsqueeze(1)).sum(1).to(torch.long)
+            P_all[n] = P_n  # update with compressed per-element estimate
+        else:
+            P_n = P_all[n]
+            sq_sv = evecs = Nn_eff = None  # computed lazily below if needed
+
+        max_P = int(P_n.max().item())
 
         if max_P == 0 or Mn == 0 or Nn == 0:
             # All patches are pure noise at this mode.
@@ -437,18 +479,38 @@ def _denoise_patches(
             cur_dims[n] = 0
             break
 
-        # left singular vectors U_n of X_n via eigh of the smaller gram matrix.
-        U_n = _left_singular_vecs(Xn, Mn, Nn, max_P)  # (B, Mn, max_P)
-
-        # Project: Xn_reduced = U_n^H @ Xn  →  (B, max_P, Nn).
-        # This is what the MATLAB passes as "X = V*S" to the next iteration.
-        Xn_reduced = U_n.mH @ Xn  # (B, max_P, Nn)
-
-        # Zero out components beyond each patch's own P_n.
+        # Zero-keep mask: True for components within each patch's own rank.
         keep = torch.arange(max_P, device=device).unsqueeze(0) < P_n.unsqueeze(
             1
         )  # (B, max_P)
-        Xn_reduced = Xn_reduced * keep.to(Xn_reduced.dtype).unsqueeze(2)
+
+        if opt_shrink and n == num_modes - 1:
+            # Apply Frobenius-optimal shrinkage at the last mode using the
+            # compressed dimensions — mirrors MATLAB.
+            # sq_sv, evecs and Nn_eff already computed above (last mode is always n>0).
+            if Mn <= Nn:
+                U_n = evecs[:, :, :max_P]  # (B, Mn, max_P) left singular vecs
+            else:
+                V = evecs[:, :, :max_P]  # (B, Nn, max_P) right singular vecs
+                U_n, _ = torch.linalg.qr(Xn @ V)  # (B, Mn, max_P)
+            shrunk = _opt_shrink_batched(
+                sq_sv[:, :max_P], P_n, sigma2_b, Mn, Nn_eff, keep
+            )
+            orig_sv = sq_sv[:, :max_P].sqrt().masked_fill(sq_sv[:, :max_P] == 0, 1.0)
+            scale = (shrunk / orig_sv) * keep.to(sq_sv.dtype)  # (B, max_P)
+            Xn_reduced = (U_n.mH @ Xn) * scale.unsqueeze(2)  # (B, max_P, Nn)
+        elif n > 0:
+            # Intermediate Tucker mode: use precomputed evecs for projection.
+            if Mn <= Nn:
+                U_n = evecs[:, :, :max_P]
+            else:
+                V = evecs[:, :, :max_P]
+                U_n, _ = torch.linalg.qr(Xn @ V)
+            Xn_reduced = U_n.mH @ Xn * keep.to(Xn.dtype).unsqueeze(2)
+        else:
+            # Mode 0 (spatial): standard left-singular-vector projection.
+            U_n = _left_singular_vecs(Xn, Mn, Nn, max_P)  # (B, Mn, max_P)
+            Xn_reduced = U_n.mH @ Xn * keep.to(Xn.dtype).unsqueeze(2)  # (B, max_P, Nn)
 
         U_list.append((U_n, Mn))
         cur_dims[n] = max_P
@@ -456,42 +518,6 @@ def _denoise_patches(
         # Refold back to multi-mode shape with updated dim n.
         rest = [cur_dims[i] for i in range(num_modes) if i != n]
         X = _mode_refold(Xn_reduced.reshape([B, max_P] + rest), n, cur_dims, num_modes)
-
-    # ------------------------------------------------------------------
-    # Optional: Frobenius-optimal shrinkage on the final Tucker core,
-    # applied to the last mode (mirrors MATLAB's last-iteration shrinkage).
-    # ------------------------------------------------------------------
-    if opt_shrink and len(P_all) > 0 and all(d > 0 for d in cur_dims):
-        n_last = num_modes - 1
-        Xl, Ml, Nl = _mode_unfold(X, n_last, cur_dims)
-        Kl = min(Ml, Nl)
-        if Kl > 1:
-            P_last = P_all[n_last]
-            sq_sv_l, evecs_l = _eigh_descending(Xl, Ml, Nl)
-            signal_mask_l = torch.arange(Kl, device=device).unsqueeze(
-                0
-            ) < P_last.unsqueeze(1)
-            shrunk_l = _opt_shrink_batched(
-                sq_sv_l, P_last, sigma2_b, Ml, Nl, signal_mask_l
-            )
-            orig_sv_l = sq_sv_l.sqrt()
-            scale_l = shrunk_l / orig_sv_l.masked_fill(orig_sv_l == 0, 1.0)  # (B, Kl)
-
-            # Reconstruct Xl with scaled singular values:
-            # Xl_out = U_l @ diag(scale) @ U_l^H @ Xl   (if Ml <= Nl, gram is on left)
-            if Ml <= Nl:
-                U_l = evecs_l  # (B, Ml, Kl) left vecs
-                XV = U_l.mH @ Xl  # (B, Kl, Nl)
-                Xl_out = (U_l * scale_l.unsqueeze(1)) @ XV  # (B, Ml, Nl)
-            else:
-                V_l = evecs_l  # (B, Nl, Kl) right vecs
-                XV = Xl @ V_l  # (B, Ml, Kl)
-                Xl_out = (XV * scale_l.unsqueeze(1)) @ V_l.mH  # (B, Ml, Nl)
-
-            rest_l = [cur_dims[i] for i in range(num_modes) if i != n_last]
-            X = _mode_refold(
-                Xl_out.reshape([B, Ml] + rest_l), n_last, cur_dims, num_modes
-            )
 
     # ------------------------------------------------------------------
     # Backward pass — reconstruct full-size patch from Tucker core.
@@ -525,8 +551,9 @@ def _denoise_patches(
         X = _mode_refold(Xout.reshape([B, orig_Mn] + rest), n, cur_dims, num_modes)
 
     denoised_patches = X.reshape(B, W, n_meas)
-    n_signal_b = P_all[0]  # spatial-mode rank for SNR formula
-    return denoised_patches, sigma2_b, n_signal_b
+    # Stack per-mode ranks (B, num_modes): spatial + each measurement mode.
+    p_all_b = torch.stack([P_n.to(real_dtype) for P_n in P_all], dim=1)
+    return denoised_patches, sigma2_b, p_all_b
 
 
 # ---------------------------------------------------------------------------
@@ -584,8 +611,38 @@ def _eigvalsh_descending(
         gram = Xn @ Xn.mH  # (B, Mn, Mn)
     else:
         gram = Xn.mH @ Xn  # (B, Nn, Nn)
-    sq_sv = torch.linalg.eigvalsh(gram)
+    sq_sv = _safe_eigvalsh(gram)
     return sq_sv.flip(-1).clamp(min=0)[:, :K]
+
+
+# cuSolver's cusolverDnXsyevBatched has a batch-size limit that varies by
+# CUDA version (observed crashes at batch sizes above ~15k on some systems).
+# This constant caps eigh sub-batches to stay safely within that limit.
+_EIGH_MAX_BATCH = 8192
+
+
+def _safe_eigvalsh(gram: torch.Tensor) -> torch.Tensor:
+    """torch.linalg.eigvalsh with sub-batching to avoid cuSolver batch-size limits."""
+    B = gram.shape[0]
+    if B <= _EIGH_MAX_BATCH:
+        return torch.linalg.eigvalsh(gram)
+    chunks = []
+    for start in range(0, B, _EIGH_MAX_BATCH):
+        chunks.append(torch.linalg.eigvalsh(gram[start : start + _EIGH_MAX_BATCH]))
+    return torch.cat(chunks, 0)
+
+
+def _safe_eigh(gram: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """torch.linalg.eigh with sub-batching to avoid cuSolver batch-size limits."""
+    B = gram.shape[0]
+    if B <= _EIGH_MAX_BATCH:
+        return torch.linalg.eigh(gram)
+    sv_chunks, ev_chunks = [], []
+    for start in range(0, B, _EIGH_MAX_BATCH):
+        sv, ev = torch.linalg.eigh(gram[start : start + _EIGH_MAX_BATCH])
+        sv_chunks.append(sv)
+        ev_chunks.append(ev)
+    return torch.cat(sv_chunks, 0), torch.cat(ev_chunks, 0)
 
 
 def _eigh_descending(
@@ -602,10 +659,10 @@ def _eigh_descending(
     K = min(Mn, Nn)
     if Mn <= Nn:
         gram = Xn @ Xn.mH  # (B, Mn, Mn)
-        sq_sv, evecs = torch.linalg.eigh(gram)
+        sq_sv, evecs = _safe_eigh(gram)
     else:
         gram = Xn.mH @ Xn  # (B, Nn, Nn)
-        sq_sv, evecs = torch.linalg.eigh(gram)
+        sq_sv, evecs = _safe_eigh(gram)
     sq_sv = sq_sv.flip(-1).clamp(min=0)[:, :K]
     evecs = evecs.flip(-1)[:, :, :K]
     return sq_sv, evecs
@@ -627,11 +684,11 @@ def _left_singular_vecs(
     """
     if Mn <= Nn:
         gram = Xn @ Xn.mH  # (B, Mn, Mn)
-        _, evecs = torch.linalg.eigh(gram)
+        _, evecs = _safe_eigh(gram)
         U = evecs.flip(-1)[:, :, :max_P]
     else:
         gram = Xn.mH @ Xn  # (B, Nn, Nn)
-        _, evecs = torch.linalg.eigh(gram)
+        _, evecs = _safe_eigh(gram)
         V = evecs.flip(-1)[:, :, :max_P]  # (B, Nn, max_P) right singular vecs
         US = Xn @ V  # (B, Mn, max_P) = U * Σ  (columns are orthogonal)
         # Columns of US are already orthogonal (U*Σ), just normalise to get U.
@@ -699,7 +756,7 @@ def _opt_shrink_batched(
     n_signal_b: torch.Tensor,
     sigma2_b: torch.Tensor,
     W: int,
-    M: int,
+    M: int | torch.Tensor,
     signal_mask: torch.Tensor,
 ) -> torch.Tensor:
     """Frobenius-optimal singular value shrinkage (Gavish & Donoho, 2017), batched.
@@ -710,7 +767,8 @@ def _opt_shrink_batched(
         sq_singvals: (B, K) squared singular values.
         n_signal_b:  (B,) signal component count per patch.
         sigma2_b:    (B,) noise variance per patch.
-        W, M:        Patch dimensions (rows, columns).
+        W:           Row count (int).
+        M:           Column count — int or (B,) tensor for per-element values.
         signal_mask: (B, K) bool — True for signal components.
 
     Returns:
