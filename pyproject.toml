@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mp-pca-tensor-denoising = "mp_pca_tensor_denoising:main"
+denoise_tensor = "mppca_denoising.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.9.22,<0.10.0"]

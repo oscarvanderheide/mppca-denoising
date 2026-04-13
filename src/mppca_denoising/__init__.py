@@ -4,4 +4,6 @@ __all__ = ["denoise_tensor"]
 
 
 def main() -> None:
-    print("mp-pca-tensor-denoising — use denoise_tensor() to denoise data.")
+    from .cli import main as cli_main
+
+    cli_main()

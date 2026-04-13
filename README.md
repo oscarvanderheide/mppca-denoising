@@ -19,6 +19,17 @@ denoised, sigma2, P, snr_gain = denoise_tensor(data, window=[5, 5, 5], device="c
 
 `data` is a `(*spatial_dims, M)` NumPy array or PyTorch tensor, real or complex.
 
+CLI usage:
+
+```bash
+uv run denoise_tensor input.npy --window 5 5 5
+```
+
+This writes `input_denoised.npz` containing `denoised`, `sigma2`, `p`, and `snr_gain`.
+Use `--output result.mat` to write MATLAB output instead, and `--input-key` for `.npz` or `.mat`
+inputs with multiple arrays.
+For multidimensional MRI data, pass one window value per spatial dimension, e.g. `--window 5 5 5`.
+
 
 ## Parameters
 
@@ -32,7 +43,7 @@ denoised, sigma2, P, snr_gain = denoise_tensor(data, window=[5, 5, 5], device="c
 | `sigma2` | `None` | Known noise variance; estimated from data if `None` |
 | `device` | auto | PyTorch device (`"cuda"`, `"cpu"`) |
 | `dtype` | auto | `float32`/`complex64` on CUDA, else matches input |
-| `batch_size` | `4096` | Patches per kernel call (auto-raised to 262144 on CUDA) |
+| `batch_size` | `8192` | Patches processed per denoising batch; lower it if CUDA runs out of memory |
 
 
 ## Benchmark
