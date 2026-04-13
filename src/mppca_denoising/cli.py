@@ -8,7 +8,7 @@ import numpy as np
 import scipy.io as sio
 import torch
 
-from .denoise import denoise_tensor
+from .denoise import denoise_tensor, fallback_stats_context
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +94,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8192,
         help="Patch batch size passed to denoise_tensor",
+    )
+    parser.add_argument(
+        "--solver",
+        choices=("auto", "eigh", "svd"),
+        default="auto",
+        help=(
+            "Gram-matrix decomposition backend. 'auto' probes one batch and picks a "
+            "backend; 'eigh' is the default fast path; 'svd' can be faster on some "
+            "pathological complex datasets."
+        ),
     )
     parser.set_defaults(opt_shrink=True)
     return parser.parse_args()
@@ -207,6 +217,27 @@ def _normalise_window_and_stride(
     return window, stride
 
 
+def _print_fallback_stats(stats: dict[str, int]) -> None:
+    if not any(stats.values()):
+        return
+
+    print(
+        "Eigh fallback stats: "
+        f"eigh split batches={stats['eigh_split_batches']}, "
+        f"eigh leaf fallbacks={stats['eigh_leaf_fallbacks']}, "
+        f"eigvalsh split batches={stats['eigvalsh_split_batches']}, "
+        f"eigvalsh leaf fallbacks={stats['eigvalsh_leaf_fallbacks']}",
+        flush=True,
+    )
+
+    if stats["eigh_leaf_fallbacks"] >= 256 or stats["eigh_split_batches"] >= 4096:
+        print(
+            "Fallback activity is high. If this is a pathological complex dataset, "
+            "retry with --solver svd.",
+            flush=True,
+        )
+
+
 def main() -> None:
     args = parse_args()
 
@@ -226,22 +257,25 @@ def main() -> None:
         flush=True,
     )
     print(f"Using batch_size={args.batch_size}", flush=True)
+    print(f"Using solver={args.solver}", flush=True)
     print(f"Writing output to {output_path}", flush=True)
     print("Starting denoising...", flush=True)
 
     try:
-        denoised, sigma2_map, n_signal_map, snr_gain_map = denoise_tensor(
-            data,
-            window=window,
-            mask=mask,
-            stride=stride,
-            center_assign=args.center_assign,
-            opt_shrink=args.opt_shrink,
-            sigma2=args.sigma2,
-            device=device,
-            dtype=_torch_dtype(args.dtype),
-            batch_size=args.batch_size,
-        )
+        with fallback_stats_context() as fallback_stats:
+            denoised, sigma2_map, n_signal_map, snr_gain_map = denoise_tensor(
+                data,
+                window=window,
+                mask=mask,
+                stride=stride,
+                center_assign=args.center_assign,
+                opt_shrink=args.opt_shrink,
+                sigma2=args.sigma2,
+                device=device,
+                dtype=_torch_dtype(args.dtype),
+                batch_size=args.batch_size,
+                solver=args.solver,
+            )
     except torch.OutOfMemoryError as exc:
         if device.startswith("cuda"):
             raise SystemExit(
@@ -249,6 +283,8 @@ def main() -> None:
                 "Retry with a smaller batch size, for example: --batch-size 1024"
             ) from exc
         raise
+
+    _print_fallback_stats(fallback_stats)
 
     arrays = {
         "denoised": denoised.detach().cpu().numpy(),

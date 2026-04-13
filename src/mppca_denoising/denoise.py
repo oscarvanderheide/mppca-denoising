@@ -15,6 +15,7 @@ as a single flat index.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from math import prod
 
 import numpy as np
@@ -24,6 +25,47 @@ import torch
 # heuristic for batched small matrices (our (B, K, K) gram matrices, K = min(W, M)).
 # https://github.com/pytorch/pytorch/pull/175403
 os.environ.setdefault("TORCH_LINALG_EIGH_BACKEND", "3")
+
+
+_ACTIVE_FALLBACK_STATS: dict[str, int] | None = None
+_ACTIVE_SOLVER: str = "eigh"
+
+
+@contextmanager
+def fallback_stats_context() -> dict[str, int]:
+    """Collect eig fallback counters during a denoising run."""
+    global _ACTIVE_FALLBACK_STATS
+
+    stats = {
+        "eigvalsh_split_batches": 0,
+        "eigvalsh_leaf_fallbacks": 0,
+        "eigh_split_batches": 0,
+        "eigh_leaf_fallbacks": 0,
+    }
+    previous = _ACTIVE_FALLBACK_STATS
+    _ACTIVE_FALLBACK_STATS = stats
+    try:
+        yield stats
+    finally:
+        _ACTIVE_FALLBACK_STATS = previous
+
+
+def _increment_fallback_stat(name: str) -> None:
+    if _ACTIVE_FALLBACK_STATS is not None:
+        _ACTIVE_FALLBACK_STATS[name] += 1
+
+
+@contextmanager
+def solver_context(solver: str):
+    """Temporarily select the gram-matrix decomposition backend."""
+    global _ACTIVE_SOLVER
+
+    previous = _ACTIVE_SOLVER
+    _ACTIVE_SOLVER = solver
+    try:
+        yield
+    finally:
+        _ACTIVE_SOLVER = previous
 
 
 @torch.no_grad()
@@ -39,6 +81,7 @@ def denoise_tensor(
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
     batch_size: int = 8192,
+    solver: str = "auto",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Denoise MRI data of shape (*spatial_dims, M) using tMPPCA.
 
@@ -53,6 +96,7 @@ def denoise_tensor(
         device:        PyTorch device.
         dtype:         Computation dtype. Defaults to float32/complex64 on CUDA, else input dtype.
         batch_size:    Patches per GPU kernel call.
+        solver:        Gram-matrix decomposition backend: "auto" (default), "eigh", or "svd".
 
     Returns:
         denoised:     Denoised array, same shape as input.
@@ -60,9 +104,10 @@ def denoise_tensor(
         n_signal_map: Signal component count per voxel, shape (*spatial_dims,).
         snr_gain_map: Estimated SNR improvement per voxel, shape (*spatial_dims,).
     """
-    # Large batches keep the GPU fully occupied.
-    if _is_cuda(device):
-        batch_size = max(batch_size, 262144)
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if solver not in {"auto", "eigh", "svd"}:
+        raise ValueError(f"solver must be 'auto', 'eigh' or 'svd', got {solver!r}")
 
     # Validate inputs and move to target device and dtype.
     data, window, mask, stride, device, dtype = _prepare_inputs(
@@ -88,131 +133,212 @@ def denoise_tensor(
     patch_corners = _valid_patch_corners(spatial_shape, window, stride, device)
     n_patches = len(patch_corners)
 
-    # Allocate overlap-accumulation buffers for the sliding-window average.
-    real_dtype = torch.zeros(1, dtype=dtype).real.dtype
-    denoised_acc = torch.zeros_like(data_flat)
-    count_acc = torch.zeros(n_vox, dtype=real_dtype, device=device)
-    sigma2_acc = torch.zeros(n_vox, dtype=real_dtype, device=device)
-    # p_all_acc: per-mode signal rank accumulator used for SNR_gain and n_signal output.
-    # Shape (n_vox, 1) for 1-dir; (n_vox, 1+len(meas_shape)) for Tucker.
-    n_modes_return = 1 if len(meas_shape) == 1 else len(meas_shape) + 1
-    p_all_acc = torch.zeros(n_vox, n_modes_return, dtype=real_dtype, device=device)
-
-    # Denoise patches in mini-batches and scatter-accumulate the results.
-    # Building index tensors per batch bounds peak memory.
-    n_done = 0
-    for b_start in range(0, n_patches, batch_size):
-        corners_b = patch_corners[b_start : b_start + batch_size]
-        vox_inds = corners_b.unsqueeze(1) + patch_offsets.unsqueeze(
-            0
-        )  # (B, patch_size)
-
-        # Skip patches that contain no masked voxels.
-        active = (
-            mask_flat[vox_inds[:, centre_offset]]
-            if center_assign
-            else mask_flat[vox_inds].any(1)
+    effective_solver = solver
+    if solver == "auto":
+        effective_solver, probe_stats = _auto_select_solver(
+            data_flat=data_flat,
+            mask_flat=mask_flat,
+            patch_corners=patch_corners,
+            patch_offsets=patch_offsets,
+            centre_offset=centre_offset,
+            meas_shape=meas_shape,
+            opt_shrink=opt_shrink,
+            sigma2=sigma2,
+            center_assign=center_assign,
+            batch_size=batch_size,
+            device=device,
         )
-        if not active.any():
-            n_done += len(corners_b)
-            continue
-        vox_inds = vox_inds[active]
-
-        patches = data_flat[vox_inds]  # (B, patch_size, n_meas)
-        denoised_patches, sigma2_b, p_all_b = _denoise_patches(
-            patches, meas_shape=meas_shape, opt_shrink=opt_shrink, sigma2=sigma2
-        )
-
-        if center_assign:
-            # Assign only the denoised centre voxel of each patch — no overlap between patches.
-            centre_inds = vox_inds[:, centre_offset]
-            denoised_acc.scatter_add_(
-                0,
-                centre_inds.unsqueeze(1).expand(-1, n_meas),
-                denoised_patches[:, centre_offset, :],
-            )
-            count_acc.scatter_add_(
-                0,
-                centre_inds,
-                torch.ones(len(centre_inds), dtype=real_dtype, device=device),
-            )
-            sigma2_acc.scatter_add_(0, centre_inds, sigma2_b)
-            p_all_acc.scatter_add_(
-                0,
-                centre_inds.unsqueeze(1).expand(-1, n_modes_return),
-                p_all_b.to(real_dtype),
-            )
-        else:
-            # Accumulate every voxel's denoised estimate from all patches it belongs to.
-            flat_inds = vox_inds.reshape(-1)
-            denoised_acc.scatter_add_(
-                0,
-                flat_inds.unsqueeze(1).expand(-1, n_meas),
-                denoised_patches.reshape(-1, n_meas),
-            )
-            count_acc.scatter_add_(
-                0,
-                flat_inds,
-                torch.ones(len(flat_inds), dtype=real_dtype, device=device),
-            )
-            sigma2_acc.scatter_add_(
-                0, flat_inds, sigma2_b.unsqueeze(1).expand(-1, patch_size).reshape(-1)
-            )
-            p_all_acc.scatter_add_(
-                0,
-                flat_inds.unsqueeze(1).expand(-1, n_modes_return),
-                p_all_b.to(real_dtype)
-                .unsqueeze(1)
-                .expand(-1, patch_size, -1)
-                .reshape(-1, n_modes_return),
-            )
-
-        n_done += len(corners_b)
         print(
-            f"\r  Patches: {n_done}/{n_patches} ({100 * n_done / n_patches:.0f}%)",
-            end="",
+            "  Auto solver selected "
+            f"{effective_solver} "
+            f"(probe eigh split batches={probe_stats['eigh_split_batches']}, "
+            f"leaf fallbacks={probe_stats['eigh_leaf_fallbacks']})",
             flush=True,
         )
 
-    print(f"\r  Patches: {n_patches}/{n_patches} (100%)")
+    with solver_context(effective_solver):
 
-    # Divide by overlap count to get each voxel's average denoised estimate.
-    # Voxels touched by no patch (boundary region) keep their original value.
-    unvisited = count_acc == 0
-    denoised_acc[unvisited] = data_flat[unvisited]
-    sigma2_acc[unvisited] = float("nan")
-    p_all_acc[unvisited] = float("nan")
-    count_acc[unvisited] = 1
-    denoised_acc /= count_acc.unsqueeze(1)
-    sigma2_acc /= count_acc
-    p_all_acc /= count_acc.unsqueeze(1)
+        # Allocate overlap-accumulation buffers for the sliding-window average.
+        real_dtype = torch.zeros(1, dtype=dtype).real.dtype
+        denoised_acc = torch.zeros_like(data_flat)
+        count_acc = torch.zeros(n_vox, dtype=real_dtype, device=device)
+        sigma2_acc = torch.zeros(n_vox, dtype=real_dtype, device=device)
+        # p_all_acc: per-mode signal rank accumulator used for SNR_gain and n_signal output.
+        # Shape (n_vox, 1) for 1-dir; (n_vox, 1+len(meas_shape)) for Tucker.
+        n_modes_return = 1 if len(meas_shape) == 1 else len(meas_shape) + 1
+        p_all_acc = torch.zeros(n_vox, n_modes_return, dtype=real_dtype, device=device)
 
-    # SNR gain formula matching MATLAB's denoise_recursive_tensor.
-    # 1-dir:  sqrt(W*M / (P*(W+M-P)))
-    # Tucker: sqrt(prod(modal_sizes) / (prod(P_k) + sum((sz_k-P_k)*P_k)))
-    if n_modes_return == 1:
-        p0 = p_all_acc[:, 0]
-        snr_gain = torch.sqrt(
-            torch.tensor(float(patch_size * n_meas), dtype=real_dtype, device=device)
-            / (p0 * (patch_size + n_meas - p0))
+        # Denoise patches in mini-batches and scatter-accumulate the results.
+        # Building index tensors per batch bounds peak memory.
+        n_done = 0
+        for b_start in range(0, n_patches, batch_size):
+            corners_b = patch_corners[b_start : b_start + batch_size]
+            vox_inds = corners_b.unsqueeze(1) + patch_offsets.unsqueeze(
+                0
+            )  # (B, patch_size)
+
+            # Skip patches that contain no masked voxels.
+            active = (
+                mask_flat[vox_inds[:, centre_offset]]
+                if center_assign
+                else mask_flat[vox_inds].any(1)
+            )
+            if not active.any():
+                n_done += len(corners_b)
+                continue
+            vox_inds = vox_inds[active]
+
+            patches = data_flat[vox_inds]  # (B, patch_size, n_meas)
+            denoised_patches, sigma2_b, p_all_b = _denoise_patches(
+                patches, meas_shape=meas_shape, opt_shrink=opt_shrink, sigma2=sigma2
+            )
+
+            if center_assign:
+                # Assign only the denoised centre voxel of each patch — no overlap between patches.
+                centre_inds = vox_inds[:, centre_offset]
+                denoised_acc.scatter_add_(
+                    0,
+                    centre_inds.unsqueeze(1).expand(-1, n_meas),
+                    denoised_patches[:, centre_offset, :],
+                )
+                count_acc.scatter_add_(
+                    0,
+                    centre_inds,
+                    torch.ones(len(centre_inds), dtype=real_dtype, device=device),
+                )
+                sigma2_acc.scatter_add_(0, centre_inds, sigma2_b)
+                p_all_acc.scatter_add_(
+                    0,
+                    centre_inds.unsqueeze(1).expand(-1, n_modes_return),
+                    p_all_b.to(real_dtype),
+                )
+            else:
+                # Accumulate every voxel's denoised estimate from all patches it belongs to.
+                flat_inds = vox_inds.reshape(-1)
+                denoised_acc.scatter_add_(
+                    0,
+                    flat_inds.unsqueeze(1).expand(-1, n_meas),
+                    denoised_patches.reshape(-1, n_meas),
+                )
+                count_acc.scatter_add_(
+                    0,
+                    flat_inds,
+                    torch.ones(len(flat_inds), dtype=real_dtype, device=device),
+                )
+                sigma2_acc.scatter_add_(
+                    0, flat_inds, sigma2_b.unsqueeze(1).expand(-1, patch_size).reshape(-1)
+                )
+                p_all_acc.scatter_add_(
+                    0,
+                    flat_inds.unsqueeze(1).expand(-1, n_modes_return),
+                    p_all_b.to(real_dtype)
+                    .unsqueeze(1)
+                    .expand(-1, patch_size, -1)
+                    .reshape(-1, n_modes_return),
+                )
+
+            n_done += len(corners_b)
+            print(
+                f"\r  Patches: {n_done}/{n_patches} ({100 * n_done / n_patches:.0f}%)",
+                end="",
+                flush=True,
+            )
+
+        print(f"\r  Patches: {n_patches}/{n_patches} (100%)")
+
+        # Divide by overlap count to get each voxel's average denoised estimate.
+        # Voxels touched by no patch (boundary region) keep their original value.
+        unvisited = count_acc == 0
+        denoised_acc[unvisited] = data_flat[unvisited]
+        sigma2_acc[unvisited] = float("nan")
+        p_all_acc[unvisited] = float("nan")
+        count_acc[unvisited] = 1
+        denoised_acc /= count_acc.unsqueeze(1)
+        sigma2_acc /= count_acc
+        p_all_acc /= count_acc.unsqueeze(1)
+
+        # SNR gain formula matching MATLAB's denoise_recursive_tensor.
+        # 1-dir:  sqrt(W*M / (P*(W+M-P)))
+        # Tucker: sqrt(prod(modal_sizes) / (prod(P_k) + sum((sz_k-P_k)*P_k)))
+        if n_modes_return == 1:
+            p0 = p_all_acc[:, 0]
+            snr_gain = torch.sqrt(
+                torch.tensor(float(patch_size * n_meas), dtype=real_dtype, device=device)
+                / (p0 * (patch_size + n_meas - p0))
+            )
+        else:
+            modal_sizes = torch.tensor(
+                [float(patch_size)] + [float(m) for m in meas_shape],
+                dtype=real_dtype,
+                device=device,
+            )
+            total_size = modal_sizes.prod()
+            prod_p = p_all_acc.prod(dim=1)
+            sum_noise = ((modal_sizes.unsqueeze(0) - p_all_acc) * p_all_acc).sum(dim=1)
+            snr_gain = torch.sqrt(total_size / (prod_p + sum_noise))
+
+        return (
+            denoised_acc.reshape(data.shape),
+            sigma2_acc.reshape(spatial_shape),
+            p_all_acc.reshape(spatial_shape + (n_modes_return,)).squeeze(-1),
+            snr_gain.reshape(spatial_shape),
         )
-    else:
-        modal_sizes = torch.tensor(
-            [float(patch_size)] + [float(m) for m in meas_shape],
-            dtype=real_dtype,
-            device=device,
-        )
-        total_size = modal_sizes.prod()
-        prod_p = p_all_acc.prod(dim=1)
-        sum_noise = ((modal_sizes.unsqueeze(0) - p_all_acc) * p_all_acc).sum(dim=1)
-        snr_gain = torch.sqrt(total_size / (prod_p + sum_noise))
 
-    return (
-        denoised_acc.reshape(data.shape),
-        sigma2_acc.reshape(spatial_shape),
-        p_all_acc.reshape(spatial_shape + (n_modes_return,)).squeeze(-1),
-        snr_gain.reshape(spatial_shape),
-    )
+
+def _auto_select_solver(
+    *,
+    data_flat: torch.Tensor,
+    mask_flat: torch.Tensor,
+    patch_corners: torch.Tensor,
+    patch_offsets: torch.Tensor,
+    centre_offset: int,
+    meas_shape: tuple[int, ...],
+    opt_shrink: bool,
+    sigma2: float | None,
+    center_assign: bool,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[str, dict[str, int]]:
+    """Pick a decomposition backend using a one-batch probe on complex CUDA inputs."""
+    zero_stats = {
+        "eigvalsh_split_batches": 0,
+        "eigvalsh_leaf_fallbacks": 0,
+        "eigh_split_batches": 0,
+        "eigh_leaf_fallbacks": 0,
+    }
+
+    if device.type != "cuda" or not data_flat.is_complex():
+        return "eigh", zero_stats
+
+    probe_batch_size = min(batch_size, 4096)
+    with solver_context("eigh"):
+        for b_start in range(0, len(patch_corners), probe_batch_size):
+            corners_b = patch_corners[b_start : b_start + probe_batch_size]
+            vox_inds = corners_b.unsqueeze(1) + patch_offsets.unsqueeze(0)
+            active = (
+                mask_flat[vox_inds[:, centre_offset]]
+                if center_assign
+                else mask_flat[vox_inds].any(1)
+            )
+            if not active.any():
+                continue
+
+            probe_patches = data_flat[vox_inds[active]]
+            with fallback_stats_context() as probe_stats:
+                _denoise_patches(
+                    probe_patches,
+                    meas_shape=meas_shape,
+                    opt_shrink=opt_shrink,
+                    sigma2=sigma2,
+                )
+            if (
+                probe_stats["eigh_leaf_fallbacks"] > 0
+                or probe_stats["eigh_split_batches"] >= 16
+            ):
+                return "svd", dict(probe_stats)
+            return "eigh", dict(probe_stats)
+
+    return "eigh", zero_stats
 
 
 # ---------------------------------------------------------------------------
@@ -621,25 +747,101 @@ def _eigvalsh_descending(
 _EIGH_MAX_BATCH = 8192
 
 
+def _symmetrize_gram(gram: torch.Tensor) -> torch.Tensor:
+    """Project numerically drifted gram matrices back onto the Hermitian manifold."""
+    return 0.5 * (gram + gram.mH)
+
+
+def _svdvals_from_gram(gram: torch.Tensor) -> torch.Tensor:
+    """Return ascending eigenvalue-equivalents for a Hermitian PSD gram matrix via SVD."""
+    return torch.linalg.svdvals(gram).flip(-1)
+
+
+def _svd_from_gram(gram: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ascending eigenvalue/eigenvector surrogates for a Hermitian PSD gram matrix via SVD."""
+    U, S, _ = torch.linalg.svd(gram, full_matrices=False)
+    return S.flip(-1), U.flip(-1)
+
+
+def _robust_eigvalsh_chunk(gram: torch.Tensor) -> torch.Tensor:
+    """Robust eigvalsh for one chunk, splitting failures before leaf fallback."""
+    gram = _symmetrize_gram(gram)
+    try:
+        return torch.linalg.eigvalsh(gram)
+    except RuntimeError:
+        if gram.shape[0] == 1:
+            _increment_fallback_stat("eigvalsh_leaf_fallbacks")
+            return _svdvals_from_gram(gram)
+        _increment_fallback_stat("eigvalsh_split_batches")
+        mid = gram.shape[0] // 2
+        return torch.cat(
+            [
+                _robust_eigvalsh_chunk(gram[:mid]),
+                _robust_eigvalsh_chunk(gram[mid:]),
+            ],
+            0,
+        )
+
+
+def _robust_eigh_chunk(gram: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Robust eigh for one chunk, splitting failures before leaf fallback."""
+    gram = _symmetrize_gram(gram)
+    try:
+        return torch.linalg.eigh(gram)
+    except RuntimeError:
+        if gram.shape[0] == 1:
+            _increment_fallback_stat("eigh_leaf_fallbacks")
+            return _svd_from_gram(gram)
+        _increment_fallback_stat("eigh_split_batches")
+        mid = gram.shape[0] // 2
+        left_vals, left_vecs = _robust_eigh_chunk(gram[:mid])
+        right_vals, right_vecs = _robust_eigh_chunk(gram[mid:])
+        return torch.cat([left_vals, right_vals], 0), torch.cat(
+            [left_vecs, right_vecs], 0
+        )
+
+
 def _safe_eigvalsh(gram: torch.Tensor) -> torch.Tensor:
     """torch.linalg.eigvalsh with sub-batching to avoid cuSolver batch-size limits."""
+    if _ACTIVE_SOLVER == "svd":
+        B = gram.shape[0]
+        if B <= _EIGH_MAX_BATCH:
+            return _svdvals_from_gram(_symmetrize_gram(gram))
+        chunks = []
+        for start in range(0, B, _EIGH_MAX_BATCH):
+            chunks.append(
+                _svdvals_from_gram(_symmetrize_gram(gram[start : start + _EIGH_MAX_BATCH]))
+            )
+        return torch.cat(chunks, 0)
+
     B = gram.shape[0]
     if B <= _EIGH_MAX_BATCH:
-        return torch.linalg.eigvalsh(gram)
+        return _robust_eigvalsh_chunk(gram)
     chunks = []
     for start in range(0, B, _EIGH_MAX_BATCH):
-        chunks.append(torch.linalg.eigvalsh(gram[start : start + _EIGH_MAX_BATCH]))
+        chunks.append(_robust_eigvalsh_chunk(gram[start : start + _EIGH_MAX_BATCH]))
     return torch.cat(chunks, 0)
 
 
 def _safe_eigh(gram: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """torch.linalg.eigh with sub-batching to avoid cuSolver batch-size limits."""
+    if _ACTIVE_SOLVER == "svd":
+        B = gram.shape[0]
+        if B <= _EIGH_MAX_BATCH:
+            return _svd_from_gram(_symmetrize_gram(gram))
+        sv_chunks, ev_chunks = [], []
+        for start in range(0, B, _EIGH_MAX_BATCH):
+            sv, ev = _svd_from_gram(_symmetrize_gram(gram[start : start + _EIGH_MAX_BATCH]))
+            sv_chunks.append(sv)
+            ev_chunks.append(ev)
+        return torch.cat(sv_chunks, 0), torch.cat(ev_chunks, 0)
+
     B = gram.shape[0]
     if B <= _EIGH_MAX_BATCH:
-        return torch.linalg.eigh(gram)
+        return _robust_eigh_chunk(gram)
     sv_chunks, ev_chunks = [], []
     for start in range(0, B, _EIGH_MAX_BATCH):
-        sv, ev = torch.linalg.eigh(gram[start : start + _EIGH_MAX_BATCH])
+        sv, ev = _robust_eigh_chunk(gram[start : start + _EIGH_MAX_BATCH])
         sv_chunks.append(sv)
         ev_chunks.append(ev)
     return torch.cat(sv_chunks, 0), torch.cat(ev_chunks, 0)
