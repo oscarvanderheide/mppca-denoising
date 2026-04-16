@@ -260,12 +260,17 @@ def denoise_tensor(
         # SNR gain formula matching MATLAB's denoise_recursive_tensor.
         # 1-dir:  sqrt(W*M / (P*(W+M-P)))
         # Tucker: sqrt(prod(modal_sizes) / (prod(P_k) + sum((sz_k-P_k)*P_k)))
+        # Voxels where the estimated rank is zero (no signal detected) would
+        # give a zero denominator and produce +inf; report NaN instead since
+        # SNR gain is undefined in that case.
         if n_modes_return == 1:
             p0 = p_all_acc[:, 0]
-            snr_gain = torch.sqrt(
-                torch.tensor(float(patch_size * n_meas), dtype=real_dtype, device=device)
-                / (p0 * (patch_size + n_meas - p0))
+            denom = p0 * (patch_size + n_meas - p0)
+            numer = torch.tensor(
+                float(patch_size * n_meas), dtype=real_dtype, device=device
             )
+            snr_gain = torch.sqrt(numer / denom.clamp(min=1.0))
+            snr_gain = snr_gain.masked_fill(denom == 0, float("nan"))
         else:
             modal_sizes = torch.tensor(
                 [float(patch_size)] + [float(m) for m in meas_shape],
@@ -275,7 +280,9 @@ def denoise_tensor(
             total_size = modal_sizes.prod()
             prod_p = p_all_acc.prod(dim=1)
             sum_noise = ((modal_sizes.unsqueeze(0) - p_all_acc) * p_all_acc).sum(dim=1)
-            snr_gain = torch.sqrt(total_size / (prod_p + sum_noise))
+            denom = prod_p + sum_noise
+            snr_gain = torch.sqrt(total_size / denom.clamp(min=1.0))
+            snr_gain = snr_gain.masked_fill(denom == 0, float("nan"))
 
         return (
             denoised_acc.reshape(data.shape),
@@ -985,9 +992,16 @@ def _opt_shrink_batched(
     )  # (B, 1)
     noise_var = sigma2_b.unsqueeze(1)  # (B, 1)
 
-    # Replace noise-component entries with 1 to avoid division by zero in the formula.
-    vals_safe = sq_singvals.clone()
-    vals_safe[~signal_mask] = 1.0
+    # Treat zero-valued entries as noise even if flagged as signal: the MP
+    # estimator can include trailing zero eigenvalues (e.g. on clean low-rank
+    # patches with sigma2=0), which would otherwise cause 0/0 in the shrinkage
+    # formula and propagate NaNs into the denoised output.
+    effective_mask = signal_mask & (sq_singvals > 0)
+
+    # Replace masked-out entries with 1 to avoid division by zero in the formula.
+    vals_safe = torch.where(
+        effective_mask, sq_singvals, torch.ones_like(sq_singvals)
+    )
 
     shrunk_sq = (
         vals_safe
@@ -996,7 +1010,7 @@ def _opt_shrink_batched(
     )
 
     # Clamp negatives (sub-noise eigenvalues) and zero out noise components.
-    shrunk_singvals = shrunk_sq.clamp(min=0).sqrt() * signal_mask.to(sq_singvals.dtype)
+    shrunk_singvals = shrunk_sq.clamp(min=0).sqrt() * effective_mask.to(sq_singvals.dtype)
     return shrunk_singvals
 
 
