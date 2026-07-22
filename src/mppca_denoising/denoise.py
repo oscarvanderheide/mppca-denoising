@@ -82,6 +82,7 @@ def denoise_tensor(
     dtype: torch.dtype | None = None,
     batch_size: int = 8192,
     solver: str = "auto",
+    force_rank: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Denoise MRI data of shape (*spatial_dims, M) using tMPPCA.
 
@@ -97,6 +98,8 @@ def denoise_tensor(
         dtype:         Computation dtype. Defaults to float32/complex64 on CUDA, else input dtype.
         batch_size:    Patches per GPU kernel call.
         solver:        Gram-matrix decomposition backend: "auto" (default), "eigh", or "svd".
+        force_rank:   Fixed matrix rank to keep for single-measurement-mode data. If None,
+                      estimate the rank with the MP distribution.
 
     Returns:
         denoised:     Denoised array, same shape as input.
@@ -108,6 +111,8 @@ def denoise_tensor(
         raise ValueError(f"batch_size must be positive, got {batch_size}")
     if solver not in {"auto", "eigh", "svd"}:
         raise ValueError(f"solver must be 'auto', 'eigh' or 'svd', got {solver!r}")
+    if force_rank is not None and force_rank < 0:
+        raise ValueError(f"force_rank must be non-negative, got {force_rank}")
 
     # Validate inputs and move to target device and dtype.
     data, window, mask, stride, device, dtype = _prepare_inputs(
@@ -117,6 +122,8 @@ def denoise_tensor(
     spatial_shape = data.shape[:n_spatial]
     meas_shape = tuple(data.shape[n_spatial:])  # shape of per-voxel measurement tensor
     n_meas = prod(meas_shape)  # total measurements per voxel
+    if force_rank is not None and len(meas_shape) != 1:
+        raise ValueError("force_rank is only implemented for single measurement-mode data")
     patch_size = prod(window)  # W: voxels per patch
     n_vox = prod(spatial_shape)
 
@@ -144,6 +151,7 @@ def denoise_tensor(
             meas_shape=meas_shape,
             opt_shrink=opt_shrink,
             sigma2=sigma2,
+            force_rank=force_rank,
             center_assign=center_assign,
             batch_size=batch_size,
             device=device,
@@ -163,7 +171,7 @@ def denoise_tensor(
         denoised_acc = torch.zeros_like(data_flat)
         count_acc = torch.zeros(n_vox, dtype=real_dtype, device=device)
         sigma2_acc = torch.zeros(n_vox, dtype=real_dtype, device=device)
-        # p_all_acc: per-mode signal rank accumulator used for SNR_gain and n_signal output.
+        # p_all_acc: per-mode signal-rank accumulator used for SNR_gain and n_signal output.
         # Shape (n_vox, 1) for 1-dir; (n_vox, 1+len(meas_shape)) for Tucker.
         n_modes_return = 1 if len(meas_shape) == 1 else len(meas_shape) + 1
         p_all_acc = torch.zeros(n_vox, n_modes_return, dtype=real_dtype, device=device)
@@ -190,7 +198,11 @@ def denoise_tensor(
 
             patches = data_flat[vox_inds]  # (B, patch_size, n_meas)
             denoised_patches, sigma2_b, p_all_b = _denoise_patches(
-                patches, meas_shape=meas_shape, opt_shrink=opt_shrink, sigma2=sigma2
+                patches,
+                meas_shape=meas_shape,
+                opt_shrink=opt_shrink,
+                sigma2=sigma2,
+                force_rank=force_rank,
             )
 
             if center_assign:
@@ -302,6 +314,7 @@ def _auto_select_solver(
     meas_shape: tuple[int, ...],
     opt_shrink: bool,
     sigma2: float | None,
+    force_rank: int | None,
     center_assign: bool,
     batch_size: int,
     device: torch.device,
@@ -337,6 +350,7 @@ def _auto_select_solver(
                     meas_shape=meas_shape,
                     opt_shrink=opt_shrink,
                     sigma2=sigma2,
+                    force_rank=force_rank,
                 )
             if (
                 probe_stats["eigh_leaf_fallbacks"] > 0
@@ -415,6 +429,7 @@ def _denoise_patches(
     meas_shape: tuple[int, ...],
     opt_shrink: bool,
     sigma2: float | None,
+    force_rank: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Denoise a batch of patches via MP-PCA or Tucker sequential mode unfolding.
 
@@ -429,6 +444,7 @@ def _denoise_patches(
         meas_shape: Per-voxel measurement shape; prod(meas_shape) == n_meas.
         opt_shrink: Apply Frobenius-optimal shrinkage on the final mode.
         sigma2:     Known noise variance, or None to estimate from data.
+        force_rank: Fixed matrix rank for single measurement-mode data.
 
     Returns:
         denoised_patches: (B, W, n_meas).
@@ -456,7 +472,12 @@ def _denoise_patches(
         sq_sv = sq_sv.flip(-1).clamp(min=0)[:, :K]  # descending (B, K)
         evecs = evecs.flip(-1)[:, :, :K]  # (B, min_dim, K)
 
-        if sigma2 is None:
+        if force_rank is not None:
+            n_signal_b = torch.full(
+                (B,), min(force_rank, K), dtype=torch.long, device=device
+            )
+            sigma2_b = torch.full((B,), float("nan"), dtype=real_dtype, device=device)
+        elif sigma2 is None:
             n_signal_b, sigma2_b = _mp_estimate(sq_sv, W, M)
         else:
             sigma2_b = torch.full((B,), sigma2, dtype=real_dtype, device=device)
@@ -468,6 +489,8 @@ def _denoise_patches(
             denoised = torch.zeros_like(patches)
             return denoised, sigma2_b, n_signal_b.unsqueeze(1)
 
+        use_shrink = opt_shrink and force_rank is None
+
         # Zero-mask components beyond each patch's P.
         keep = torch.arange(max_P, device=device).unsqueeze(0) < n_signal_b.unsqueeze(
             1
@@ -476,7 +499,7 @@ def _denoise_patches(
         if W >= M:
             # evecs are V (right singular vectors), shape (B, M, K).
             V_P = evecs[:, :, :max_P]  # (B, M, max_P)
-            if opt_shrink:
+            if use_shrink:
                 # Frobenius-optimal shrinkage on the signal singular values.
                 signal_mask = keep  # (B, max_P)
                 shrunk = _opt_shrink_batched(
@@ -495,7 +518,7 @@ def _denoise_patches(
         else:
             # evecs are U (left singular vectors), shape (B, W, K).
             U_P = evecs[:, :, :max_P]  # (B, W, max_P)
-            if opt_shrink:
+            if use_shrink:
                 signal_mask = keep
                 shrunk = _opt_shrink_batched(
                     sq_sv[:, :max_P], n_signal_b, sigma2_b, W, M, signal_mask
@@ -993,7 +1016,7 @@ def _opt_shrink_batched(
     noise_var = sigma2_b.unsqueeze(1)  # (B, 1)
 
     # Treat zero-valued entries as noise even if flagged as signal: the MP
-    # estimator can include trailing zero eigenvalues (e.g. on clean low-rank
+    # estimator can include trailing zero eigenvalues (e.g. on clean low-rank,
     # patches with sigma2=0), which would otherwise cause 0/0 in the shrinkage
     # formula and propagate NaNs into the denoised output.
     effective_mask = signal_mask & (sq_singvals > 0)
