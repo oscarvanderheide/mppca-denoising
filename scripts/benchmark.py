@@ -38,16 +38,16 @@ from mppca_denoising import denoise_tensor
 # ---------------------------------------------------------------------------
 
 _ELLIPSOIDS = [
-    (1.00,  0.00,  0.00,  0.00,  0.6900, 0.9200, 0.90),
-    (-0.80,  0.00,  0.00,  0.00,  0.6624, 0.8740, 0.88),
-    (-0.20, -0.22,  0.00, -0.25,  0.4100, 0.1600, 0.21),
-    (-0.20,  0.22,  0.00, -0.25,  0.3100, 0.1100, 0.22),
-    ( 0.10,  0.00,  0.35, -0.25,  0.2100, 0.2500, 0.50),
-    ( 0.10,  0.00,  0.10, -0.25,  0.0460, 0.0460, 0.046),
-    (-0.01, -0.08, -0.65, -0.25,  0.0460, 0.0230, 0.020),
-    (-0.01,  0.06, -0.65, -0.25,  0.0230, 0.0230, 0.020),
-    ( 0.01,  0.06, -0.105, 0.625, 0.0460, 0.0230, 0.020),
-    ( 0.01,  0.00,  0.100, 0.625, 0.0230, 0.0230, 0.020),
+    (1.00, 0.00, 0.00, 0.00, 0.6900, 0.9200, 0.90),
+    (-0.80, 0.00, 0.00, 0.00, 0.6624, 0.8740, 0.88),
+    (-0.20, -0.22, 0.00, -0.25, 0.4100, 0.1600, 0.21),
+    (-0.20, 0.22, 0.00, -0.25, 0.3100, 0.1100, 0.22),
+    (0.10, 0.00, 0.35, -0.25, 0.2100, 0.2500, 0.50),
+    (0.10, 0.00, 0.10, -0.25, 0.0460, 0.0460, 0.046),
+    (-0.01, -0.08, -0.65, -0.25, 0.0460, 0.0230, 0.020),
+    (-0.01, 0.06, -0.65, -0.25, 0.0230, 0.0230, 0.020),
+    (0.01, 0.06, -0.105, 0.625, 0.0460, 0.0230, 0.020),
+    (0.01, 0.00, 0.100, 0.625, 0.0230, 0.0230, 0.020),
 ]
 
 
@@ -66,6 +66,7 @@ def _shepp_logan_3d(shape: tuple[int, int, int]) -> np.ndarray:
 
 # ---------------------------------------------------------------------------
 
+
 def _get_device(requested: str | None) -> str:
     if requested:
         return requested
@@ -77,52 +78,74 @@ def _get_device(requested: str | None) -> str:
 
 
 def _fmt_mem(n_bytes: int) -> str:
-    return f"{n_bytes / 1024 ** 3:.2f} GB"
+    return f"{n_bytes / 1024**3:.2f} GB"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument(
-        "--spatial-shape", nargs=3, type=int, default=[64, 64, 32],
+        "--spatial-shape",
+        nargs=3,
+        type=int,
+        default=[64, 64, 32],
         metavar=("NX", "NY", "NZ"),
         help="Spatial dimensions (default: 64 64 32)",
     )
     parser.add_argument(
-        "--measurements", nargs="+", type=int, default=[5],
+        "--measurements",
+        nargs="+",
+        type=int,
+        default=[5],
         metavar="M",
         help="Measurement dimensions: one int for 1-dir, multiple for Tucker "
-             "(default: 5)",
+        "(default: 5)",
     )
     parser.add_argument(
-        "--window", type=int, default=5,
+        "--window",
+        type=int,
+        default=5,
         help="Isotropic sliding-window size (default: 5)",
     )
     parser.add_argument(
-        "--opt-shrink", action="store_true", default=True,
+        "--opt-shrink",
+        action="store_true",
+        default=True,
         help="Use optimal shrinkage (default: true)",
     )
     parser.add_argument(
-        "--no-opt-shrink", dest="opt_shrink", action="store_false",
+        "--no-opt-shrink",
+        dest="opt_shrink",
+        action="store_false",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=4096,
+        "--batch-size",
+        type=int,
+        default=4096,
         help="Patch batch size (default: 4096)",
     )
     parser.add_argument(
-        "--device", default=None,
+        "--device",
+        default=None,
         help="cuda | mps | cpu (default: auto-detect)",
     )
     parser.add_argument(
-        "--snr", type=float, default=10.0,
+        "--snr",
+        type=float,
+        default=10.0,
         help="Input SNR used to scale noise (default: 10)",
     )
     parser.add_argument(
-        "--no-warmup", dest="warmup", action="store_false",
+        "--no-warmup",
+        dest="warmup",
+        action="store_false",
         help="Skip warm-up pass (small patch run)",
     )
     parser.add_argument(
-        "--repeats", type=int, default=1,
+        "--repeats",
+        type=int,
+        default=1,
         help="Number of timed repetitions (default: 1)",
     )
     args = parser.parse_args()
@@ -160,8 +183,13 @@ def main() -> None:
         print("  Warming up ...", end=" ", flush=True)
         small_shape = tuple(min(s, 16) for s in spatial_shape) + meas_shape
         small = data[tuple(slice(0, s) for s in small_shape)]
-        denoise_tensor(small, window, device=device, batch_size=args.batch_size,
-                       opt_shrink=args.opt_shrink)
+        denoise_tensor(
+            small,
+            window,
+            device=device,
+            batch_size=args.batch_size,
+            opt_shrink=args.opt_shrink,
+        )
         if device == "cuda":
             torch.cuda.synchronize()
         print("done")
@@ -174,7 +202,10 @@ def main() -> None:
             torch.cuda.reset_peak_memory_stats()
         t_start = time.perf_counter()
         _, _, _, _ = denoise_tensor(
-            data, window, device=device, batch_size=args.batch_size,
+            data,
+            window,
+            device=device,
+            batch_size=args.batch_size,
             opt_shrink=args.opt_shrink,
         )
         if device == "cuda":
@@ -188,8 +219,10 @@ def main() -> None:
     if args.repeats == 1:
         print(f"  Wall time  : {times[0]:.3f}s")
     else:
-        print(f"  Wall time  : {min(times):.3f}s min / "
-              f"{sum(times)/len(times):.3f}s mean  (over {args.repeats} reps)")
+        print(
+            f"  Wall time  : {min(times):.3f}s min / "
+            f"{sum(times) / len(times):.3f}s mean  (over {args.repeats} reps)"
+        )
     if device == "cuda":
         peak = torch.cuda.max_memory_allocated()
         print(f"  Peak VRAM  : {_fmt_mem(peak)}")
